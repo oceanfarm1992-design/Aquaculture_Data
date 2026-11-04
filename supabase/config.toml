@@ -1,0 +1,3 @@
+# Supabase CLI / GitHub integration settings. Only the project id is set; everything
+# else uses Supabase's defaults. Migrations live in supabase/migrations/.
+project_id = "aquaculture_data"

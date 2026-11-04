@@ -1,7 +1,9 @@
 name: Scrape data
 
 # Builds every table with run_all.py and saves them as a downloadable artifact.
-# No API keys are needed. Optional: set a repository variable SCRAPER_CONTACT
+# The data sources need no API keys. If SUPABASE_URL and the SUPABASE_SERVICE_ROLE_KEY
+# secret are set, the tables are also upserted into Supabase (see README).
+# Optional: set a repository variable SCRAPER_CONTACT
 # (Settings > Secrets and variables > Actions > Variables) to an email or URL that
 # data owners can use to reach you; it is sent in the User-Agent.
 
@@ -48,6 +50,27 @@ jobs:
           else
             python run_all.py --out-dir data
           fi
+
+      - name: Check Supabase settings
+        id: supabase
+        if: ${{ !cancelled() }}
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_ROLE_KEY" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Supabase not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY); skipping the database load."
+          fi
+
+      - name: Load into Supabase
+        if: ${{ !cancelled() && steps.supabase.outputs.configured == 'true' }}
+        env:
+          SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: python load_to_supabase.py --data-dir data
 
       - name: Summarise output
         if: always()
