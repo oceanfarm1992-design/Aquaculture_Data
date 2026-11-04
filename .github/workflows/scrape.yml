@@ -35,9 +35,9 @@ jobs:
     permissions:
       contents: write   # to publish the run's data as a GitHub Release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
           cache: pip
@@ -123,7 +123,7 @@ jobs:
 
       - name: Upload data
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aquaculture-data-${{ github.run_number }}
           path: data/

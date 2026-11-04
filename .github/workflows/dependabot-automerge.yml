@@ -21,8 +21,8 @@ jobs:
       matrix:
         python-version: ["3.11", "3.14"]   # oldest and newest supported
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install dependencies
@@ -38,7 +38,7 @@ jobs:
     steps:
       - name: Read the update details
         id: meta
-        uses: dependabot/fetch-metadata@v2
+        uses: dependabot/fetch-metadata@v3
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
