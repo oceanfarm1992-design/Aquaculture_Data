@@ -7,8 +7,8 @@ load_to_supabase.py — upsert the tables built by run_all.py into a Supabase da
     python load_to_supabase.py                    # loads data/*.json
     python load_to_supabase.py --only production_by_country
 
-The tables must already exist: they are created by
-supabase/migrations/20261104000000_create_aquaculture_tables.sql.
+The tables must already exist: they are created by the SQL files in
+supabase/migrations/ (apply them in filename order).
 
 Rows are upserted on each table's primary key, so loading the same scrape twice
 updates rows instead of duplicating them. Uses Supabase's REST API (PostgREST) over
@@ -41,26 +41,26 @@ TABLES: dict[str, tuple[list[str], list[str]]] = {
         ["site_number", "facility_id", "facility_name", "species", "latitude", "longitude",
          "capacity", "capacity_unit", "company", "org_numbers", "license_numbers", "water_type",
          "placement_type", "municipality", "county", "production_area", "status",
-         "registered_date", "source", "retrieved_at"]),
+         "registered_date", "source", "retrieved_at", "source_url", "record_url", "reference_url"]),
     "companies_norway": (
         ["org_number"],
         ["org_number", "company_name", "legal_form", "nace_code", "nace_description", "employees",
          "founded_date", "registered_date", "website", "address", "postcode", "city",
          "municipality", "country", "parent_org_number", "bankrupt", "under_liquidation",
-         "source", "retrieved_at"]),
+         "source", "retrieved_at", "source_url", "record_url", "reference_url"]),
     "prices_norway_salmon_export": (
         ["period", "product_code", "measure_code"],
         ["period", "product_code", "product", "measure_code", "measure", "value",
-         "source", "retrieved_at"]),
+         "source", "retrieved_at", "source_url", "record_url", "reference_url"]),
     "production_by_country": (
         ["country_iso3", "year", "indicator_id"],
         ["country_iso3", "year", "indicator_id", "country", "indicator", "value", "unit",
-         "source", "retrieved_at"]),
+         "source", "retrieved_at", "source_url", "record_url", "reference_url"]),
     "trade_fish_by_country": (
         ["year", "reporter_code", "flow_code", "partner_code", "hs_code"],
         ["year", "reporter_code", "flow_code", "partner_code", "hs_code", "reporter_iso3",
          "reporter", "flow", "partner", "commodity", "net_weight_kg", "quantity",
-         "quantity_unit", "trade_value_usd", "source", "retrieved_at"]),
+         "quantity_unit", "trade_value_usd", "source", "retrieved_at", "source_url", "record_url", "reference_url"]),
 }
 
 

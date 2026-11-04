@@ -15,28 +15,31 @@ from urllib.parse import parse_qs, urlparse
 
 import load_to_supabase as lts
 
-MIGRATION = next(Path(__file__).parent.glob("supabase/migrations/*_create_aquaculture_tables.sql"))
+MIGRATIONS = sorted(Path(__file__).parent.glob("supabase/migrations/*.sql"))
 
 
 def migration_tables() -> dict[str, tuple[list[str], list[str]]]:
-    """Parse table -> (primary key, columns) out of the migration SQL."""
-    sql = re.sub(r"--[^\n]*", "", MIGRATION.read_text())
-    tables = {}
-    for name, body in re.findall(r"create table if not exists public\.(\w+)\s*\((.*?)\n\);", sql, re.S):
-        columns, pk = [], []
-        for line in body.splitlines():
-            line = line.strip().rstrip(",").strip()
-            if not line:
-                continue
-            m = re.match(r"primary key \(([^)]*)\)", line)
-            if m:
-                pk = [c.strip() for c in m.group(1).split(",")]
-                continue
-            col = line.split()[0]
-            columns.append(col)
-            if "primary key" in line:
-                pk = [col]
-        tables[name] = (pk, columns)
+    """Apply every migration in order (on paper) and return table -> (primary key, columns)."""
+    tables: dict[str, tuple[list[str], list[str]]] = {}
+    for path in MIGRATIONS:
+        sql = re.sub(r"--[^\n]*", "", path.read_text())
+        for name, body in re.findall(r"create table if not exists public\.(\w+)\s*\((.*?)\n\);", sql, re.S):
+            columns, pk = [], []
+            for line in body.splitlines():
+                line = line.strip().rstrip(",").strip()
+                if not line:
+                    continue
+                m = re.match(r"primary key \(([^)]*)\)", line)
+                if m:
+                    pk = [c.strip() for c in m.group(1).split(",")]
+                    continue
+                col = line.split()[0]
+                columns.append(col)
+                if "primary key" in line:
+                    pk = [col]
+            tables[name] = (pk, columns)
+        for name, body in re.findall(r"alter table public\.(\w+)\s+(add column.*?);", sql, re.S):
+            tables[name][1].extend(re.findall(r"add column if not exists (\w+)", body))
     return tables
 
 

@@ -1,9 +1,26 @@
 # Data schema
 
-`run_all.py` writes five linked tables to `data/`, each as `.csv` and `.json`. Every row also has two provenance columns:
+`run_all.py` writes five linked tables to `data/`, each as `.csv` and `.json`. Every row ends with five provenance columns, so any value can be traced back and cited:
 
-- `source`: which source the row came from
-- `retrieved_at`: when it was downloaded (UTC)
+| Column | Meaning |
+|---|---|
+| `source` | Name of the source, e.g. "UN Comtrade (public preview)" |
+| `source_url` | The exact API request the row came from, query string included. Opening it shows the raw data. For Statistics Norway the query is sent in the request body, so this is the table's API address; use `reference_url` to view the data |
+| `record_url` | A link to this one record, where the source has one (Brønnøysund companies, ArcGIS features); otherwise empty |
+| `reference_url` | The page to cite for the dataset as a whole (see below) |
+| `retrieved_at` | When the row was downloaded (UTC) |
+
+Reference pages:
+
+| Table | `reference_url` |
+|---|---|
+| `facilities_norway` | https://api.fiskeridir.no/pub-aqua/api/v1/sites |
+| `companies_norway` | https://data.brreg.no/enhetsregisteret/api/docs/index.html |
+| `prices_norway_salmon_export` | https://www.ssb.no/en/statbank/table/03024 |
+| `production_by_country` | https://data.worldbank.org/indicator/ER.FSH.AQUA.MT |
+| `trade_fish_by_country` | https://comtradeplus.un.org/ |
+
+Override it for any run with `--reference-url`.
 
 ## Database keys
 
