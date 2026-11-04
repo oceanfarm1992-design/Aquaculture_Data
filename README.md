@@ -2,7 +2,7 @@
 
 [![Tests](https://github.com/oceanfarm1992-design/Aquaculture_Data/actions/workflows/tests.yml/badge.svg)](https://github.com/oceanfarm1992-design/Aquaculture_Data/actions/workflows/tests.yml)
 
-A polite, fault-tolerant Python scraper that collects aquaculture data from public APIs for **Norway** and the **UAE**, and saves it as clean, flat CSV (UTF-8) and JSON tables.
+A polite, fault-tolerant Python bot that collects public aquaculture data — global production statistics, European and Norwegian farm sites, companies, prices, trade, research and news — and keeps it as clean, flat CSV (UTF-8) and JSON tables, a permanent archive and (optionally) a Supabase database.
 
 **No API key, account or login is needed to scrape.** Every source is open data. Saving to your own Supabase database is optional; see [Storing data in Supabase](#storing-data-in-supabase).
 
@@ -24,13 +24,33 @@ python run_all.py --contact you@example.org
 
 | Table | Data | Source |
 |---|---|---|
-| `facilities_norway` | Every fish-farm site: name, species, lat/lon, capacity, licence holder | Fiskeridirektoratet Aquaculture Register |
-| `companies_norway` | Aquaculture companies: org number, employees, address, founding date | Brønnøysund Register Centre |
+| `fao_aquaculture_production` | Every country × species × area × environment × year since 1950, tonnes and USD | FAO FishStat |
+| `production_by_country` | Aquaculture, capture and total fisheries production, every country, since 1990 | World Bank (FAO data) |
+| `eurostat_aquaculture_production` | EU-27, Norway, Iceland: production by species, area and environment | Eurostat (`fish_aq2a`) |
+| `facilities_europe` | European aquaculture sites and areas (finfish, shellfish, …) with attributes and geometry | EMODnet Human Activities |
+| `facilities_norway` | Every Norwegian fish-farm site: name, species, lat/lon, capacity, licence holder | Fiskeridirektoratet Aquaculture Register |
+| `companies_norway` | Norwegian aquaculture companies: org number, employees, address, founding date | Brønnøysund Register Centre |
 | `prices_norway_salmon_export` | Weekly salmon export volume and price | Statistics Norway (table 03024) |
-| `production_by_country` | Aquaculture production per year, Norway + UAE | World Bank (FAO data) |
 | `trade_fish_by_country` | Fish and seafood imports and exports, Norway + UAE | UN Comtrade (public preview) |
+| `research_publications` | Scientific papers on aquaculture (last 35 days each run; accumulates) | OpenAlex |
+| `research_datasets` | Published aquaculture datasets (newest 1,000 each run; accumulates) | Zenodo |
+| `news_articles` | Aquaculture and fish-farming news (last 8 days each run; accumulates) | GDELT |
 
 UN Comtrade's keyless preview returns at most 500 rows per request, so the scraper sends one request per year. With the default products and both countries that is about 32 rows per year.
+
+### What is not collected
+
+- **Private data:** daily feeding and mortality logs, batch and traceability records, costs and buyer contracts. These belong to farms and companies.
+- **Sources that need an account or key:** BarentsWatch (Norwegian lice and disease per site), USDA NASS, the full UN Comtrade API, Copernicus Marine. The bot is kept keyless.
+- **Social media and job sites:** their terms forbid scraping.
+
+## How data is kept
+
+Each weekly run keeps everything three ways:
+
+1. **GitHub Releases (permanent).** Every run is published as a release named `data-<date>-run<number>`, holding every table as CSV and JSON in one zip. Releases don't expire, so this is the full history.
+2. **Supabase (optional).** Rows are upserted and never deleted. `first_seen_at` records when a row first appeared, and `retrieved_at` when it was last seen; a row whose `retrieved_at` stops advancing has disappeared from its source. Research and news accumulate run after run.
+3. **Workflow artifact (90 days).** A quick download from the run's page.
 
 ## Running one source
 
@@ -40,6 +60,12 @@ python aquaculture_scraper.py --source worldbank --countries "NOR;ARE" --years 2
 python aquaculture_scraper.py --source comtrade --reporters 578,784 --years 2019:2023
 python aquaculture_scraper.py --source ssb_salmon --last-weeks 104
 python aquaculture_scraper.py --source brreg --nace 03.211
+python aquaculture_scraper.py --source fao_aquaculture
+python aquaculture_scraper.py --source eurostat --geo NO,ES,EL
+python aquaculture_scraper.py --source emodnet
+python aquaculture_scraper.py --source openalex --query "salmon lice" --since-days 365
+python aquaculture_scraper.py --source zenodo --query "recirculating aquaculture" --max-pages 10
+python aquaculture_scraper.py --source gdelt --timespan 30d
 ```
 
 A single-source run writes `aquaculture_data.csv` and `aquaculture_data.json` to the current folder. Change that with `--out-dir` and `--basename`.
@@ -82,7 +108,7 @@ Exit codes: `0` success, `1` partial (some pages failed or interrupted), `2` no 
 ## Automated runs (GitHub Actions)
 
 - **Tests** (`.github/workflows/tests.yml`): runs all offline tests on Python 3.10, 3.12 and 3.13 on every push to `main` and every pull request.
-- **Scrape data** (`.github/workflows/scrape.yml`): runs `run_all.py` every Monday at 03:17 UTC, and whenever you start it by hand. If Supabase is set up, it also loads the tables into your database.
+- **Scrape data** (`.github/workflows/scrape.yml`): runs `run_all.py` every Monday at 03:17 UTC, and whenever you start it by hand. It archives every run as a GitHub Release and, if Supabase is set up, loads the tables into your database (see [How data is kept](#how-data-is-kept)).
 
 To run a scrape now:
 
@@ -141,10 +167,26 @@ python -m unittest discover -v -p "test_*.py"
 
 ## Status
 
-All connectors are built from each API's documented response format and tested against mock servers, but **none has been run against the live API yet**. The field names most likely to need adjusting are Fiskeridir's. If Brønnøysund has moved to the new SN2025 industry codes, pass the new codes with `--nace`. Run each source once with `--raw --max-pages 1` to check.
+All connectors are built from each API's documented response format and tested against mock servers, but **none has been run against the live APIs yet**. Things most likely to need adjusting on the first live run:
+
+- **Fiskeridir** field names.
+- **FAO:** the release zip is looked up at `https://www.fao.org/fishery/static/Data/Aquaculture_<year>.1.<n>.zip` for the last four years. If FAO has renamed it, pass the zip link from the [download page](https://www.fao.org/fishery/en/collection/aquaculture) with `--url`. Columns and code lists are matched by name, and the log lists what was found if anything is missing.
+- **EMODnet:** layers are found by matching names and titles (`--layer-pattern`), so a renamed layer is still picked up.
+- **Brønnøysund:** if it has moved to the new SN2025 industry codes, pass them with `--nace`.
+
+Run a source once with `--raw --max-pages 1` to see the real field names.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
 
-The license covers this code only. Data you collect stays under its source's own terms (for example the NLOD licence for Norwegian government data, or UN Comtrade's terms of use).
+The license covers this code only. Data you collect stays under its source's own terms. Notable ones:
+
+- **FAO FishStat:** CC BY-NC-SA 3.0 IGO. Non-commercial use only, with attribution.
+- **Norwegian government data:** NLOD.
+- **OpenAlex:** CC0.
+- **EMODnet:** CC BY 4.0.
+- **Zenodo:** each dataset has its own licence, stored in the `license` column.
+- **GDELT and UN Comtrade:** their own terms of use.
+
+Check the source's terms before republishing.

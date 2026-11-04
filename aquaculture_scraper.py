@@ -25,6 +25,22 @@ Sources (--source):
                    year, flow and product. Uses the keyless public preview (max 500
                    rows per request, so it sends one request per year).
 
+  Global & regional bulk statistics
+    fao_aquaculture  FAO FishStat global aquaculture production: every country × species ×
+                     area × environment × year since 1950, tonnes and USD (yearly zip).
+    eurostat         Eurostat fish_aq2a: aquaculture production for EU countries, Norway and
+                     Iceland by species, area and environment (one request per country).
+
+  European sites
+    emodnet          EMODnet Human Activities map service: every aquaculture layer
+                     (finfish, shellfish, ...) with site attributes and geometry.
+
+  Research & news
+    openalex         OpenAlex: scientific publications matching --query (default
+                     "aquaculture") published in the last --since-days days.
+    zenodo           Zenodo: published datasets matching --query, newest first.
+    gdelt            GDELT: news articles about aquaculture from the last --timespan.
+
   Generic
     obis           OBIS species occurrence records, e.g. --species "Sparus aurata".
     arcgis         Any ArcGIS REST map layer: --url ".../FeatureServer/0".
@@ -117,6 +133,11 @@ class SourceConfig:
     table: str = DEFAULT_BASENAME  # table name used by run_all.py / SCHEMA.md
     reference_url: str | None = None  # page to cite for the dataset (reference_url column)
     record_url: Callable[[dict], str | None] | None = None  # link to one record (record_url column)
+    # Fetches everything itself instead of paging a JSON API: returns ([(record, url)], failures)
+    custom_fetch: Callable[..., tuple[list[tuple[dict, str]], int]] | None = None
+    next_cursor_path: str | None = None  # cursor pagination: next-page token in the response
+    cursor_start: str | None = None  # cursor pagination: token for the first page (e.g. "*")
+    max_consecutive_failures: int = 3
     # Query-parameter names used by the paginators
     page_param: str = "page"
     size_param: str = "per_page"
@@ -217,6 +238,66 @@ SSB_SALMON_FIELDS: FieldMap = {
     "value": ["value"],
 }
 
+FAO_FIELDS: FieldMap = {k: [k] for k in (
+    "country_un_code", "country_iso3", "country", "species_code", "species", "scientific_name",
+    "species_group", "area_code", "area", "environment_code", "environment", "measure", "year",
+    "value", "status", "cell_key")}
+
+EUROSTAT_FIELDS: FieldMap = {
+    "geo": ["geo"], "country": ["geo_label"],
+    "species_code": ["species"], "species": ["species_label"],
+    "area_code": ["fishreg"], "area": ["fishreg_label"],
+    "environment_code": ["aquaenv"], "environment": ["aquaenv_label"],
+    "unit_code": ["unit"], "unit": ["unit_label"],
+    "year": ["time"], "value": ["value"], "cell_key": ["cell_key"],
+}
+
+EMODNET_FIELDS: FieldMap = {
+    "layer": ["layer"], "layer_title": ["layer_title"], "feature_id": ["feature_id"],
+    "name": ["properties.name", "properties.NAME", "properties.site_name", "properties.sitename",
+             "properties.SITE_NAME", "properties.farm_name"],
+    "country": ["properties.country", "properties.COUNTRY", "properties.country_code",
+                "properties.countrycode", "properties.CNTR_CODE"],
+    "species": ["properties.species", "properties.SPECIES", "properties.species_name"],
+    "status": ["properties.status", "properties.STATUS"],
+    "geometry_type": ["geometry_type"], "latitude": ["latitude"], "longitude": ["longitude"],
+    "properties": ["properties"], "geometry": ["geometry"],
+}
+
+OPENALEX_FIELDS: FieldMap = {
+    "openalex_id": ["id"], "doi": ["doi"], "title": ["display_name", "title"],
+    "publication_year": ["publication_year"], "publication_date": ["publication_date"],
+    "type": ["type"], "language": ["language"],
+    "journal": ["primary_location.source.display_name"],
+    "authors": ["authorships[*].author.display_name"],
+    "institutions": ["authorships[*].institutions[*].display_name"],
+    "countries": ["authorships[*].countries[*]"],
+    "topics": ["topics[*].display_name", "concepts[*].display_name"],
+    "cited_by_count": ["cited_by_count"],
+    "is_open_access": ["open_access.is_oa"], "open_access_url": ["open_access.oa_url"],
+    "landing_page_url": ["primary_location.landing_page_url"],
+}
+
+ZENODO_FIELDS: FieldMap = {
+    "zenodo_id": ["id"], "doi": ["doi", "metadata.doi"], "title": ["metadata.title", "title"],
+    "publication_date": ["metadata.publication_date"],
+    "resource_type": ["metadata.resource_type.title", "metadata.resource_type.type"],
+    "creators": ["metadata.creators[*].name"], "keywords": ["metadata.keywords[*]"],
+    "license": ["metadata.license.id", "metadata.license"],
+    "landing_page_url": ["links.self_html", "links.html"],
+}
+
+GDELT_FIELDS: FieldMap = {
+    "url": ["url"], "title": ["title"], "seen_date": ["seendate"], "domain": ["domain"],
+    "language": ["language"], "source_country": ["sourcecountry"], "image_url": ["socialimage"],
+}
+
+# EU-27 plus Norway and Iceland (Eurostat geo codes; Greece is EL)
+EUROSTAT_GEO = ("AT BE BG CY CZ DE DK EE EL ES FI FR HR HU IE IT LT LU LV MT NL PL PT RO SE "
+                "SI SK NO IS").split()
+
+WORLDBANK_FISHERY_INDICATORS = "ER.FSH.AQUA.MT;ER.FSH.CAPT.MT;ER.FSH.PROD.MT"
+
 OBIS_FIELDS: FieldMap = {
     "record_id": ["id"],
     "species": ["scientificName", "species"],
@@ -307,14 +388,74 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
     elif s == "worldbank":
         countries = args.countries or "NOR;ARE"
         indicator = args.indicator or "ER.FSH.AQUA.MT"
+        params = {"format": "json", "date": args.years or "2000:2024"}
+        if ";" in indicator:
+            params["source"] = "2"  # several indicators in one call must name their source (2 = WDI)
         cfg = SourceConfig(
             name=f"World Bank WDI {indicator} (FAO data)",
             url=f"https://api.worldbank.org/v2/country/{countries}/indicator/{indicator}",
             pagination="page", page_size=1000, records_path="[1]", pages_path="[0].pages",
-            total_path="[0].total", missing_records_is_empty=True,
-            params={"format": "json", "date": args.years or "2000:2024"},
+            total_path="[0].total", missing_records_is_empty=True, params=params,
             field_map=WORLDBANK_FIELDS, table="production_by_country",
-            reference_url=f"https://data.worldbank.org/indicator/{indicator}")
+            reference_url=f"https://data.worldbank.org/indicator/{indicator.split(';')[0]}")
+    elif s == "fao_aquaculture":
+        import bulk_sources
+        cfg = SourceConfig(
+            name="FAO FishStat Global Aquaculture Production",
+            url="https://www.fao.org/fishery/static/Data/", pagination="none",
+            custom_fetch=bulk_sources.fetch_fao_zip, field_map=FAO_FIELDS, id_field="cell_key",
+            table="fao_aquaculture_production",
+            reference_url="https://www.fao.org/fishery/en/collection/aquaculture")
+    elif s == "eurostat":
+        geo = args.geo.split(",") if args.geo else EUROSTAT_GEO
+        cfg = SourceConfig(
+            name="Eurostat fish_aq2a (aquaculture production)",
+            url="https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/fish_aq2a",
+            pagination="values", iterate_param="geo", iterate_values=geo, parser="jsonstat",
+            params={"format": "JSON", "lang": "EN"}, field_map=EUROSTAT_FIELDS, id_field="cell_key",
+            max_consecutive_failures=10, table="eurostat_aquaculture_production",
+            reference_url="https://ec.europa.eu/eurostat/databrowser/view/fish_aq2a/default/table")
+    elif s == "emodnet":
+        import bulk_sources
+        cfg = SourceConfig(
+            name="EMODnet Human Activities (aquaculture layers)",
+            url="https://ows.emodnet-humanactivities.eu/wfs", pagination="none", page_size=1000,
+            params={"layer_pattern": args.layer_pattern or
+                    r"aquacult|finfish|shellfish|mussel|oyster|mollus|fish.?farm|seaweed|algae"},
+            custom_fetch=bulk_sources.fetch_wfs_layers, field_map=EMODNET_FIELDS,
+            id_field="feature_id", table="facilities_europe",
+            reference_url="https://emodnet.ec.europa.eu/en/human-activities")
+    elif s == "openalex":
+        since = (date.today() - timedelta(days=args.since_days)).isoformat()
+        params = {"search": args.query or "aquaculture",
+                  "filter": f"from_publication_date:{since}", "sort": "publication_date:desc"}
+        if args.contact and "@" in args.contact:
+            params["mailto"] = args.contact  # OpenAlex's "polite pool" for identified clients
+        cfg = SourceConfig(
+            name="OpenAlex (scholarly works)", url="https://api.openalex.org/works",
+            pagination="cursor", records_path="results", page_size=200, size_param="per-page",
+            cursor_param="cursor", cursor_start="*", next_cursor_path="meta.next_cursor",
+            total_path="meta.count", params=params, field_map=OPENALEX_FIELDS, id_field="id",
+            table="research_publications", reference_url="https://openalex.org/",
+            record_url=lambda r: r.get("doi") or r.get("id"))
+    elif s == "zenodo":
+        cfg = SourceConfig(
+            name="Zenodo (research datasets)", url="https://zenodo.org/api/records",
+            pagination="page", page_size=25, page_param="page", size_param="size",
+            records_path="hits.hits", total_path="hits.total", missing_records_is_empty=True,
+            params={"q": args.query or "aquaculture", "type": "dataset", "sort": "mostrecent"},
+            field_map=ZENODO_FIELDS, id_field="id", table="research_datasets",
+            reference_url="https://zenodo.org/",
+            record_url=lambda r: get_path(r, "links.self_html") or get_path(r, "links.html"))
+    elif s == "gdelt":
+        query = args.query or '(aquaculture OR "fish farm" OR "fish farming" OR mariculture OR "salmon farming")'
+        cfg = SourceConfig(
+            name="GDELT DOC 2.0 (news articles)", url="https://api.gdeltproject.org/api/v2/doc/doc",
+            pagination="none", records_path="articles", missing_records_is_empty=True,
+            params={"query": query, "mode": "artlist", "format": "json", "maxrecords": "250",
+                    "timespan": args.timespan, "sort": "DateDesc"},
+            field_map=GDELT_FIELDS, id_field="url", table="news_articles",
+            reference_url="https://www.gdeltproject.org/", record_url=lambda r: r.get("url"))
     elif s == "comtrade":
         reporters = args.reporters or ",".join(COUNTRY_CODES.values())
         this_year = date.today().year
@@ -468,7 +609,8 @@ def apply_field_map(record: dict, field_map: FieldMap) -> dict:
 
 def jsonstat_to_records(body: Any) -> list[dict] | None:
     """Turn a JSON-stat 2.0 dataset (used by SSB, Eurostat and other statistics offices)
-    into long-format rows: one row per cell, with each dimension's code and label."""
+    into long-format rows: one row per cell that has a value, with each dimension's code
+    and label, the value, and a cell_key that uniquely identifies the cell."""
     if not isinstance(body, dict) or "id" not in body or "dimension" not in body:
         return None
     ids, values = body["id"], body.get("value", [])
@@ -483,15 +625,30 @@ def jsonstat_to_records(body: Any) -> list[dict] | None:
         else:
             codes = sorted(index, key=index.get)
         categories.append([(code, labels.get(code, code)) for code in codes])
+    sizes = [len(c) for c in categories]
+
+    if isinstance(values, dict):  # sparse cube: only filled cells are listed
+        cells = sorted(((int(k), v) for k, v in values.items()), key=lambda kv: kv[0])
+    else:
+        cells = list(enumerate(values))
     records = []
-    for flat, combo in enumerate(itertools.product(*categories)):
-        value = values.get(str(flat)) if isinstance(values, dict) else (
-            values[flat] if flat < len(values) else None)
+    for flat, value in cells:
+        if value is None:
+            continue
+        position, rest = [], flat
+        for size in reversed(sizes):  # row-major: the last dimension changes fastest
+            position.append(rest % size if size else 0)
+            rest //= size or 1
+        position.reverse()
         row: dict[str, Any] = {}
-        for dim, (code, label) in zip(ids, combo):
+        key_parts = []
+        for dim, idx, cats in zip(ids, position, categories):
+            code, label = cats[idx]
             row[dim] = code
             row[f"{dim}_label"] = label
+            key_parts.append(f"{dim}={code}")
         row["value"] = value
+        row["cell_key"] = "|".join(key_parts)
         records.append(row)
     return records
 
@@ -658,9 +815,9 @@ class CursorPaginator(Paginator):  # ?after=<id of last record>
 
     def __init__(self, cfg):
         super().__init__(cfg)
-        if not cfg.id_field:
+        if not cfg.id_field and not cfg.next_cursor_path:
             raise SystemExit("cursor pagination needs --id-field")
-        self.cursor: Any = None
+        self.cursor: Any = cfg.cursor_start
 
     def params(self):
         p = {self.cfg.size_param: self.cfg.page_size}
@@ -669,6 +826,12 @@ class CursorPaginator(Paginator):  # ?after=<id of last record>
         return p
 
     def advance(self, raw_records, body):
+        if self.cfg.next_cursor_path:  # the API hands out the next page's token
+            nxt = get_path(body, self.cfg.next_cursor_path)
+            if not nxt or nxt == self.cursor:
+                return False
+            self.cursor = nxt
+            return True
         last = raw_records[-1] if raw_records else None
         cursor = get_path(last, self.cfg.id_field) if isinstance(last, dict) else None
         if cursor is None or cursor == self.cursor:
@@ -795,8 +958,46 @@ def polite_sleep(delay: float) -> None:
         time.sleep(delay + random.uniform(0, delay * 0.5))  # jitter spreads load
 
 
+def _scrape_bulk(cfg: SourceConfig, session: requests.Session, delay: float) -> ScrapeResult:
+    """Sources with their own fetcher (bulk files, map services)."""
+    result = ScrapeResult()
+    seen_keys: set[Any] = set()
+    log.info("Source: %s — %s (bulk download)", cfg.name, cfg.url)
+    try:
+        pairs, failed = cfg.custom_fetch(session, cfg, delay)
+    except FetchError as exc:
+        log.error("Download failed: %s", exc)
+        result.pages_failed = 1
+        return result
+    except KeyboardInterrupt:
+        result.interrupted = True
+        return result
+    result.pages_failed = failed
+    result.pages_ok = 1
+    for i, (raw, url) in enumerate(pairs):
+        try:
+            row, key = parse_record(raw, cfg, url)
+        except Exception as exc:  # one bad record must never stop the run
+            result.records_skipped += 1
+            log.warning("Skipping record %d: %s: %s", i, type(exc).__name__, exc)
+            continue
+        if key is not None:
+            if key in seen_keys:
+                result.duplicates += 1
+                continue
+            seen_keys.add(key)
+        result.records.append(row)
+    log.info("Successfully parsed %d records (%d skipped, %d duplicates).",
+             len(result.records), result.records_skipped, result.duplicates)
+    return result
+
+
 def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
-           delay: float, max_consecutive_failures: int = 3) -> ScrapeResult:
+           delay: float, max_consecutive_failures: int | None = None) -> ScrapeResult:
+    if cfg.custom_fetch:
+        return _scrape_bulk(cfg, session, delay)
+    if max_consecutive_failures is None:
+        max_consecutive_failures = cfg.max_consecutive_failures
     pager = PAGINATORS[cfg.pagination](cfg)
     result = ScrapeResult()
     seen_keys: set[Any] = set()
@@ -966,8 +1167,8 @@ def save_outputs(df: pd.DataFrame, out_dir: Path, basename: str) -> tuple[Path, 
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
-SOURCES = ["fiskeridir", "brreg", "ssb_salmon", "worldbank", "comtrade",
-           "obis", "arcgis", "custom"]
+SOURCES = ["fiskeridir", "brreg", "ssb_salmon", "worldbank", "comtrade", "fao_aquaculture",
+           "eurostat", "emodnet", "openalex", "zenodo", "gdelt", "obis", "arcgis", "custom"]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -989,6 +1190,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--weeks-to", help="week pagination: last ISO week, e.g. 2025-W52")
     g.add_argument("--last-weeks", type=int, default=52, help="ssb_salmon: number of recent weeks")
     g.add_argument("--species", help="obis: scientific name, e.g. 'Salmo salar'")
+    g.add_argument("--geo", help="eurostat: country codes, e.g. NO,ES,EL (default EU-27 + NO + IS)")
+    g.add_argument("--layer-pattern", help="emodnet: regex for the layers to download")
+    g.add_argument("--query", help="openalex / zenodo / gdelt: search terms")
+    g.add_argument("--since-days", type=int, default=30,
+                   help="openalex: publications from the last N days (default 30)")
+    g.add_argument("--timespan", default="7d", help="gdelt: how far back, e.g. 7d, 2w, 3m (default 7d)")
 
     a = p.add_argument_group("advanced")
     a.add_argument("--param", action="append", metavar="KEY=VALUE",
