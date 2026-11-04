@@ -1,6 +1,6 @@
 # Data schema
 
-`run_all.py` writes ten tables to `data/`, each as `.csv` and `.json`. Every row ends with five provenance columns, so any value can be traced back and cited:
+`run_all.py` writes ten weekly tables and ten monthly species tables to `data/`, each as `.csv` and `.json`. Every row ends with five provenance columns, so any value can be traced back and cited:
 
 | Column | Meaning |
 |---|---|
@@ -176,6 +176,45 @@ One row per country × year × flow × HS product, with the world as partner. Ca
 | `trade_value_usd` | Value in US dollars |
 
 HS 03 covers wild-caught and farmed products together; trade statistics don't separate them. It uses the keyless public preview, capped at 500 rows per request, so the scraper sends one request per year.
+
+## Species tables (monthly)
+
+One set of rows per species: every name in `species.txt`, plus the 100 biggest aquaculture species in FAO's production data over the last five years. FishBase tables also include every species FishBase marks as used in aquaculture.
+
+| Table | Primary key | Joins to |
+|---|---|---|
+| `species_taxonomy` | `aphia_id` (WoRMS) | `valid_aphia_id` is the accepted species; `ncbi_taxid`, `fishbase_id` (= FishBase `SpecCode`), `itis_tsn`, `fao_code` (= `fao_aquaculture_production.species_code`) |
+| `species_common_names` | `cell_key` (species, name, language) | `aphia_id` → accepted species |
+| `species_synonyms` | `aphia_id`, `synonym_aphia_id` | |
+| `species_distribution` | `cell_key` | `aphia_id`; `establishment_means` (native, alien, …), `invasiveness`, `location_id` (Marine Regions) |
+| `species_attributes` | `cell_key` | `aphia_id`; `measurement_type` / `measurement_value`, e.g. "IUCN Red List Category" / "Least Concern (LC)"; `details` (JSON) holds sub-values such as the assessment year |
+| `species_gbif_summary` | `gbif_key` | `iucn_category`, `iucn_code`, `occurrence_count`, `countries` (JSON: country code → records) |
+| `species_occurrences` | `gbif_id` | `taxon_key` → `species_gbif_summary.gbif_key` |
+| `species_genomes` | `accession` | `tax_id` → `species_taxonomy.ncbi_taxid`. When GenBank (GCA_) and RefSeq (GCF_) hold the same assembly, only the RefSeq copy is kept |
+| `species_profile` | `spec_code` (FishBase) | `data` (JSON) holds every FishBase species and estimate column. FishBase flags use -1 for yes and 0 for no |
+| `fishbase_records` | `fb_table`, `row_key` | `spec_code` → `species_profile`; `fb_table` names the FishBase table (`popgrowth`, `poplw`, `maturity`, …); `data` (JSON) is the row |
+
+Species names are looked up once per run and shared by all the tables, so each species costs about a dozen requests in total.
+
+### How the species categories are covered
+
+| Category | Where | Not covered (and why) |
+|---|---|---|
+| 1. Taxonomy & identity | `species_taxonomy`, `species_common_names`, `species_synonyms`; IUCN in `species_gbif_summary` and `species_attributes`; native/introduced/invasive in `species_distribution` | CITES listing (Species+ needs a token) |
+| 2. Morphology & biology | `species_profile` (max length, weight, age, body shape, habitat); `fishbase_records`: `popgrowth` (L∞, K, t₀, M), `poplw` (a, b), `popchar`, `oxygen`; temperature preferences in `species_profile` | Fin formulas, coloration and other free-text descriptions |
+| 3. Distribution & habitat | `species_distribution`, `species_occurrences`, depth and habitat in `species_profile`, `fishbase_records`: `country`, `introductions`, `ecology` | Climate projections |
+| 4. Life history | `fishbase_records`: `maturity`, `spawning`, `fecundity` | Larval duration and stock-recruitment (not in the published FishBase tables used here) |
+| 5. Ecology | trophic level in `species_profile`; `fishbase_records`: `ecology` | Predators, parasites; eDNA records |
+| 6. Genetics & genomics | `species_genomes`; `fishbase_records`: `genetics` (chromosome numbers) | Markers, population genetics, expression datasets |
+| 7. Aquaculture traits | `used_for_aquaculture` in `species_profile`; production and value in `fao_aquaculture_production` | FCR, stocking density, hatchery protocols (not in open structured sources) |
+| 8. Health & disease | — | WOAH has no public data API |
+| 9. Nutrition & feed | diet items in `fishbase_records` when present | Requirements and feed trials (in papers: see `research_publications`) |
+| 10. Fisheries & stocks | `production_by_country` (capture); `fishbase_records`: `stocks` | Stock assessments, MSY |
+| 11. Market & trade | `trade_fish_by_country`, `prices_norway_salmon_export` | Retail prices, certification registers |
+| 12. Legal & regulatory | IUCN category; Norwegian licences | National red lists, quotas |
+| 13. Occurrence records | `species_occurrences` (GBIF includes OBIS, museum and eDNA datasets) | |
+| 14. Media | `news_articles`, `research_publications` | Images, videos, sounds |
+| 15. Derived metrics | Built from the tables above, e.g. growth from `popgrowth` and temperature from `species_profile` | |
 
 ## Coverage of the 15 categories
 

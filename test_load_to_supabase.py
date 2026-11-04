@@ -185,7 +185,7 @@ class LoaderTests(unittest.TestCase):
 
     def test_every_run_all_table_has_a_database_table(self):
         import run_all
-        self.assertEqual(set(run_all.JOBS), set(lts.TABLES))
+        self.assertEqual(set(run_all.ALL_JOBS), set(lts.TABLES))
 
     def test_prepare_rows(self):
         rows = lts.prepare_rows("companies_norway", [

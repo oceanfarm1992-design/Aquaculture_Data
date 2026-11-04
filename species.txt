@@ -1,0 +1,19 @@
+# Species the bot always collects species data for (taxonomy, biology, occurrences, genomes).
+# One scientific name per line; text after # is ignored. The bot also adds the biggest
+# aquaculture species in FAO's production data (--top-species, default 100).
+#
+# Gulf / UAE aquaculture
+Sparus aurata          # gilthead seabream
+Sparidentex hasta      # sobaity seabream
+Lates calcarifer       # barramundi / Asian seabass
+Epinephelus coioides   # orange-spotted grouper (hamour)
+Rachycentron canadum   # cobia
+Chanos chanos          # milkfish
+Penaeus vannamei       # whiteleg shrimp
+#
+# Norway / global
+Salmo salar            # Atlantic salmon
+Oncorhynchus mykiss    # rainbow trout
+Oreochromis niloticus  # Nile tilapia
+Magallana gigas        # Pacific oyster
+Mytilus edulis         # blue mussel

@@ -40,6 +40,17 @@ Sources (--source):
                      (default "aquaculture") published in the last --since-days days.
     gdelt            GDELT: news articles about aquaculture from the last --timespan.
 
+  Species (species_sources.py; one row set per species in species.txt + FAO's top species)
+    worms_taxonomy, worms_common_names, worms_synonyms, worms_distribution, worms_attributes
+                     WoRMS: accepted name, classification, IDs, common names, synonyms,
+                     native/introduced range, traits (IUCN category, body size, ...)
+    gbif_species, gbif_occurrences
+                     GBIF: IUCN Red List category, record counts by country, recent records
+    ncbi_genomes     NCBI Datasets: sequenced genome assemblies
+    fishbase_profile, fishbase_records
+                     FishBase: biology, growth, length-weight, maturity, spawning, fecundity,
+                     ecology, distribution, aquaculture use (Parquet release on Hugging Face)
+
   Generic
     obis           OBIS species occurrence records, e.g. --species "Sparus aurata".
     arcgis         Any ArcGIS REST map layer: --url ".../FeatureServer/0".
@@ -489,6 +500,9 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
                                     "outSR": "4326", "f": "json"},
             transform=_arcgis_feature_to_record, id_field="OBJECTID", table="map_layer",
             reference_url=layer_url)
+    elif s in SPECIES_SOURCE_NAMES:
+        import species_sources
+        cfg = species_sources.build(s, args)
     else:  # custom
         if not args.url:
             raise SystemExit("--source custom needs --url")
@@ -496,7 +510,7 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
                            records_path="data", id_field="id", reference_url=args.url)
 
     overrides: dict[str, Any] = {}
-    if args.url and s not in ("arcgis",):
+    if args.url and s not in ("arcgis",) and s not in SPECIES_SOURCE_NAMES:
         overrides["url"] = args.url
     for attr in ("pagination", "page_size", "id_field", "page_param", "size_param",
                  "offset_param", "cursor_param"):
@@ -716,6 +730,8 @@ def fetch_json(session: requests.Session, url: str, params: dict, *, method: str
     if resp.status_code >= 400:
         raise FetchError(f"HTTP {resp.status_code} from {resp.url}: {resp.text[:200]!r}",
                          status=resp.status_code)
+    if resp.status_code == 204 or not resp.content.strip():
+        return None, resp.url  # "no content", e.g. WoRMS when a name has no match
     try:
         body = resp.json()
     except ValueError as exc:
@@ -931,6 +947,8 @@ class ScrapeResult:
 
 
 def extract_records(body: Any, cfg: SourceConfig) -> list | None:
+    if body is None:  # empty response: no records
+        return []
     if cfg.parser == "jsonstat":
         return jsonstat_to_records(body)
     data = body if cfg.records_path is None else get_path(body, cfg.records_path)
@@ -1200,8 +1218,14 @@ def save_outputs(df: pd.DataFrame, out_dir: Path, basename: str) -> tuple[Path, 
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
+# Species data (species_sources.py): taxonomy, biology, occurrences and genomes per species
+SPECIES_SOURCE_NAMES = ["worms_taxonomy", "worms_common_names", "worms_synonyms",
+                        "worms_distribution", "worms_attributes", "gbif_species", "gbif_occurrences",
+                        "ncbi_genomes", "fishbase_profile", "fishbase_records"]
+
 SOURCES = ["fiskeridir", "brreg", "ssb_salmon", "worldbank", "comtrade", "fao_aquaculture",
-           "eurostat", "emodnet", "openalex", "gdelt", "obis", "arcgis", "custom"]
+           "eurostat", "emodnet", "openalex", "gdelt", *SPECIES_SOURCE_NAMES,
+           "obis", "arcgis", "custom"]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1229,6 +1253,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--since-days", type=int, default=30,
                    help="openalex: publications from the last N days (default 30)")
     g.add_argument("--timespan", default="7d", help="gdelt: how far back, e.g. 7d, 2w, 3m (default 7d)")
+    g.add_argument("--species-file", default="species.txt",
+                   help="species sources: file with one scientific name per line (default species.txt)")
+    g.add_argument("--top-species", type=int, default=100,
+                   help="species sources: also the N biggest aquaculture species in FAO data (default 100)")
+    g.add_argument("--occurrences-per-species", type=int, default=300,
+                   help="gbif_occurrences: recent georeferenced records per species (default 300)")
+    g.add_argument("--fishbase-tables",
+                   help="fishbase_records: comma-separated FishBase tables (default: growth, length-weight, "
+                        "maturity, spawning, fecundity, ecology, distribution, introductions, genetics, ...)")
 
     a = p.add_argument_group("advanced")
     a.add_argument("--param", action="append", metavar="KEY=VALUE",

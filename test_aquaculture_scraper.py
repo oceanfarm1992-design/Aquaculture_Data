@@ -578,7 +578,7 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(fake_main.call_count, len(run_all.JOBS))
 
     def test_every_run_all_job_parses(self):
-        for table, (job_args, _) in run_all.JOBS.items():
+        for table, (job_args, _) in run_all.ALL_JOBS.items():
             cfg = aq.build_source(aq.parse_args(job_args))
             self.assertEqual(cfg.table, table, f"{table} preset has a different table name")
 

@@ -37,12 +37,33 @@ python run_all.py --contact you@example.org
 
 UN Comtrade's keyless preview returns at most 500 rows per request, so the scraper sends one request per year. With the default products and both countries that is about 32 rows per year.
 
+### Species data (monthly)
+
+For each species in [`species.txt`](species.txt) (edit it to add your own) plus the 100 biggest aquaculture species in FAO's production data:
+
+| Table | Data | Source |
+|---|---|---|
+| `species_taxonomy` | Accepted name, authority and year, kingdom → genus, marine/brackish/freshwater, NCBI, FishBase and ITIS IDs, FAO 3-alpha code | WoRMS |
+| `species_common_names` | Common names in many languages | WoRMS |
+| `species_synonyms` | Synonyms and why they're not accepted | WoRMS |
+| `species_distribution` | Where each species occurs, and whether it is native, introduced or invasive there | WoRMS |
+| `species_attributes` | Traits WoRMS records, such as IUCN Red List category, body size and functional group | WoRMS |
+| `species_gbif_summary` | IUCN Red List category, total occurrence records and records per country | GBIF |
+| `species_occurrences` | Recent georeferenced occurrence records (300 per species, last 10 years): lat/lon, date, country, dataset | GBIF |
+| `species_genomes` | Sequenced genome assemblies: level, size, chromosomes, N50, annotation | NCBI Datasets |
+| `species_profile` | Biology: max length, weight and age, depth range, habitat, migration, trophic level, preferred temperature, growth K, vulnerability, aquaculture use, plus every other FishBase species column | FishBase |
+| `fishbase_records` | FishBase detail tables: growth (L∞, K, t₀), length-weight (a, b), size at maturity, spawning, fecundity, ecology and diet, country ranges, introductions, genetics, oxygen use | FishBase |
+
+FishBase tables also cover every species FishBase marks as used in aquaculture, not only the species list. Run them by hand with `python run_all.py --group species`, or type `species` in the workflow's tables box.
+
 ### What is not collected
 
 - **Private data:** daily feeding and mortality logs, batch and traceability records, costs and buyer contracts. These belong to farms and companies.
 - **Sources that need an account or key:** BarentsWatch (Norwegian lice and disease per site), USDA NASS, the full UN Comtrade API, Copernicus Marine. The bot is kept keyless.
 - **Social media and job sites:** their terms forbid scraping.
 - **Zenodo:** its robots.txt does not allow bots on its API. Zenodo datasets still appear in `research_publications`, which OpenAlex fills with papers and datasets alike (`type` = `dataset`).
+- **Species sources that need a key, or whose terms forbid scraping:** the IUCN Red List API and CITES Species+ need a token, though IUCN categories still come in through WoRMS and GBIF. WOAH (animal diseases) has no public data API. Google Scholar forbids scraping.
+- **Sources that would repeat others:** OBIS records are also in GBIF; Crossref works are in OpenAlex; Ensembl genomes are in NCBI.
 - **The same numbers twice:** the World Bank's aquaculture and total-production figures are FAO data already in `fao_aquaculture_production`, so only capture fisheries is taken from the World Bank. World Bank rows for years with no value yet are dropped. Eurostat overlaps FAO for European countries but adds euro values and EU-specific breakdowns, so both are kept.
 
 ## How data is kept
@@ -68,6 +89,8 @@ python aquaculture_scraper.py --source eurostat --geo NO,ES,EL
 python aquaculture_scraper.py --source emodnet
 python aquaculture_scraper.py --source openalex --query "salmon lice" --since-days 365
 python aquaculture_scraper.py --source gdelt --timespan 30d
+python aquaculture_scraper.py --source worms_taxonomy --top-species 0   # only species.txt
+python aquaculture_scraper.py --source gbif_occurrences --occurrences-per-species 1000
 ```
 
 A single-source run writes `aquaculture_data.csv` and `aquaculture_data.json` to the current folder. Change that with `--out-dir` and `--basename`.
@@ -124,7 +147,7 @@ A run is marked failed if any table fails or is only partly collected; the files
 
 ## Staying up to date
 
-- **Data:** news and research refresh daily, and every other table weekly. FAO publishes a new release once a year; the scraper finds the newest one by itself.
+- **Data:** news and research refresh daily, species data monthly, and every other table weekly. FAO publishes a new release once a year; the scraper finds the newest one by itself.
 - **Libraries and actions:** `requirements.txt` pins exact versions, so every run uses a tested set. Each Tuesday, [Dependabot](.github/dependabot.yml) checks for new versions of the Python libraries and GitHub Actions and opens a pull request. The **Dependabot auto-merge** workflow tests it on Python 3.11 and 3.14 and merges it when the tests pass and Dependabot reports a minor or patch update. Major updates, and grouped updates that Dependabot can't classify, get a comment and wait for you.
 - **When something breaks:** if a source changes its format, that table's step fails and GitHub emails you about the failed scheduled run. Paste the log into a new session to get it fixed.
 
@@ -193,6 +216,10 @@ The license covers this code only. Data you collect stays under its source's own
 - **FAO FishStat:** CC BY-NC-SA 3.0 IGO. Non-commercial use only, with attribution.
 - **Norwegian government data:** NLOD.
 - **OpenAlex:** CC0.
+- **FishBase:** CC BY-NC. Non-commercial use only, with attribution.
+- **WoRMS:** CC BY 4.0.
+- **GBIF:** each occurrence keeps its dataset's licence (CC0, CC BY or CC BY-NC).
+- **NCBI:** free to use; check individual assemblies for any restrictions.
 - **EMODnet:** CC BY 4.0.
 - **GDELT and UN Comtrade:** their own terms of use.
 
