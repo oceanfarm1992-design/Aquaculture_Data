@@ -1,0 +1,32 @@
+# Keeps the Python libraries and GitHub Actions up to date.
+# Dependabot opens a pull request each week when something has a new release.
+# .github/workflows/dependabot-automerge.yml tests it and merges minor/patch updates.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "04:23"
+      timezone: Etc/UTC
+    groups:
+      python-libraries:          # one pull request for all library updates
+        patterns: ["*"]
+    commit-message:
+      prefix: deps
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: tuesday
+      time: "04:23"
+      timezone: Etc/UTC
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci
+    open-pull-requests-limit: 5
