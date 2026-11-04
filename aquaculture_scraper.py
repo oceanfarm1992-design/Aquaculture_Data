@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 aquaculture_scraper.py — polite, fault-tolerant scraper for aquaculture data APIs.
+Every source is open: no API key, account or login is needed.
 
 Run one source with --source. By default each run writes:
     aquaculture_data.csv   (UTF-8)
@@ -12,9 +13,6 @@ Sources (--source):
   Norway — facility level
     fiskeridir     Aquaculture Register: every fish-farm site (name, species, lat/lon,
                    capacity, licence holder). Open, no key.
-    barentswatch   Weekly fish health per site: sea lice, PD/ILA disease, treatments,
-                   fallowing, sea temperature. Needs a free BarentsWatch API client
-                   (env BW_CLIENT_ID and BW_CLIENT_SECRET).
     brreg          Brønnøysund company register: aquaculture companies by industry code
                    (org number, name, employees, address, founding date). Open, no key.
     ssb_salmon     Statistics Norway table 03024: weekly export volume and price of
@@ -24,8 +22,8 @@ Sources (--source):
     worldbank      Aquaculture production in tonnes per country per year
                    (World Bank indicator ER.FSH.AQUA.MT, sourced from FAO). Open, no key.
     comtrade       UN Comtrade fish and seafood trade (HS chapter 03) per country,
-                   year, flow and product. Works without a key (preview, max 500 rows);
-                   set COMTRADE_API_KEY for the full API.
+                   year, flow and product. Uses the keyless public preview (max 500
+                   rows per request, so it sends one request per year).
 
   Generic
     obis           OBIS species occurrence records, e.g. --species "Sparus aurata".
@@ -44,7 +42,6 @@ Examples:
     python aquaculture_scraper.py --source fiskeridir --contact you@example.org
     python aquaculture_scraper.py --source worldbank --countries "NOR;ARE" --years 2000:2024
     python aquaculture_scraper.py --source comtrade --reporters 578,784 --years 2022,2023
-    python aquaculture_scraper.py --source barentswatch --weeks-from 2025-W01 --weeks-to 2025-W52
     python aquaculture_scraper.py --source ssb_salmon --last-weeks 104
     python aquaculture_scraper.py --source custom --url https://api.example.org/v1/farms \\
         --pagination page --records-path data --field-map my_fields.json
@@ -94,18 +91,10 @@ COUNTRY_CODES = {  # ISO3 -> UN M49 code (used by UN Comtrade)
 # Source configuration
 # --------------------------------------------------------------------------------------
 @dataclass
-class OAuthConfig:
-    token_url: str
-    client_id_env: str
-    client_secret_env: str
-    scope: str | None = None
-
-
-@dataclass
 class SourceConfig:
     name: str
     url: str  # may contain {year}/{week} placeholders for week pagination
-    pagination: str  # "page" | "offset" | "range" | "cursor" | "arcgis" | "week" | "none"
+    pagination: str  # "page" | "offset" | "range" | "cursor" | "arcgis" | "week" | "values" | "none"
     records_path: str | None = None  # path to the record list; None = body is the list
     page_size: int = 100
     params: dict[str, Any] = field(default_factory=dict)
@@ -118,11 +107,10 @@ class SourceConfig:
     parser: str = "records"  # "records" | "jsonstat" (JSON-stat 2.0 cube -> rows)
     method: str = "GET"
     json_body: dict | None = None  # request body for POST APIs
-    api_key_env: str | None = None  # env var holding an API key ...
-    api_key_header: str | None = None  # ... sent in this header
-    oauth: OAuthConfig | None = None  # client-credentials login before scraping
     week_from: tuple[int, int] | None = None  # ISO (year, week), for week pagination
     week_to: tuple[int, int] | None = None
+    iterate_param: str | None = None  # "values" pagination: one request per value ...
+    iterate_values: list[str] = field(default_factory=list)  # ... of this parameter
     table: str = DEFAULT_BASENAME  # table name used by run_all.py / SCHEMA.md
     # Query-parameter names used by the paginators
     page_param: str = "page"
@@ -166,27 +154,6 @@ FISKERIDIR_FIELDS: FieldMap = {
     "production_area": ["placement.prodAreaName", "productionAreaName", "prodAreaName"],
     "status": ["status", "siteStatus"],
     "registered_date": ["firstClearanceTime", "registeredDate", "clearanceDate"],
-}
-
-BARENTSWATCH_FIELDS: FieldMap = {
-    "site_number": ["localityNo", "localityNumber"],
-    "facility_name": ["name", "localityName"],
-    "avg_adult_female_lice": ["avgAdultFemaleLice"],
-    "avg_mobile_lice": ["avgMobileLice"],
-    "avg_stationary_lice": ["avgStationaryLice"],
-    "has_reported_lice": ["hasReportedLice"],
-    "sea_temperature_c": ["seaTemperature"],
-    "is_fallow": ["isFallow"],
-    "has_pd": ["hasPd"],
-    "has_ila": ["hasIla"],
-    "has_cleaner_fish": ["hasCleanerfishDeployed"],
-    "has_mechanical_removal": ["hasMechanicalRemoval"],
-    "has_medicinal_treatment": ["hasSubstanceTreatments"],
-    "has_salmonids": ["hasSalmonoids"],
-    "is_on_land": ["isOnLand"],
-    "municipality": ["municipality"],
-    "latitude": ["lat", "latitude"],
-    "longitude": ["lon", "longitude"],
 }
 
 BRREG_FIELDS: FieldMap = {
@@ -278,6 +245,19 @@ def parse_iso_week(text: str) -> tuple[int, int]:
     return year, week
 
 
+def parse_years(text: str) -> list[str]:
+    """Parse '2022,2023' or '2019:2023' into a list of years."""
+    years: list[str] = []
+    for part in text.split(","):
+        part = part.strip()
+        if ":" in part:
+            start, end = (int(x) for x in part.split(":", 1))
+            years += [str(y) for y in range(start, end + 1)]
+        elif part:
+            years.append(str(int(part)))
+    return years
+
+
 def next_iso_week(year: int, week: int) -> tuple[int, int]:
     y, w, _ = (date.fromisocalendar(year, week, 1) + timedelta(weeks=1)).isocalendar()
     return y, w
@@ -292,23 +272,6 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             url="https://api.fiskeridir.no/pub-aqua/api/v1/sites",
             pagination="range", page_size=100, field_map=FISKERIDIR_FIELDS,
             id_field="siteId", table="facilities_norway")
-    elif s == "barentswatch":
-        last_full_week = (date.today() - timedelta(weeks=1)).isocalendar()
-        week_to = parse_iso_week(args.weeks_to) if args.weeks_to else (last_full_week[0], last_full_week[1])
-        if args.weeks_from:
-            week_from = parse_iso_week(args.weeks_from)
-        else:
-            y, w, _ = (date.fromisocalendar(*week_to, 1) - timedelta(weeks=51)).isocalendar()
-            week_from = (y, w)
-        cfg = SourceConfig(
-            name="BarentsWatch Fish Health",
-            url="https://www.barentswatch.no/bwapi/v1/geodata/fishhealth/{year}/{week}",
-            pagination="week", records_path="localities", field_map=BARENTSWATCH_FIELDS,
-            missing_records_is_empty=True, week_from=week_from, week_to=week_to,
-            oauth=OAuthConfig(token_url="https://id.barentswatch.no/connect/token",
-                              client_id_env="BW_CLIENT_ID", client_secret_env="BW_CLIENT_SECRET",
-                              scope="api"),
-            table="health_norway_weekly")
     elif s == "brreg":
         cfg = SourceConfig(
             name="Brønnøysund Register Centre (Enhetsregisteret)",
@@ -344,17 +307,16 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             field_map=WORLDBANK_FIELDS, table="production_by_country")
     elif s == "comtrade":
         reporters = args.reporters or ",".join(COUNTRY_CODES.values())
-        years = (args.years or ",".join(str(y) for y in range(date.today().year - 6, date.today().year - 1)))
-        key_set = bool(os.environ.get("COMTRADE_API_KEY"))
+        this_year = date.today().year
+        years = parse_years(args.years) if args.years else [str(y) for y in range(this_year - 6, this_year - 1)]
         cfg = SourceConfig(
-            name="UN Comtrade" + ("" if key_set else " (public preview)"),
-            url=("https://comtradeapi.un.org/data/v1/get/C/A/HS" if key_set
-                 else "https://comtradeapi.un.org/public/v1/preview/C/A/HS"),
-            pagination="none", records_path="data",
-            params={"reporterCode": reporters, "period": years.replace(":", ","),
+            name="UN Comtrade (public preview)",
+            url="https://comtradeapi.un.org/public/v1/preview/C/A/HS",
+            pagination="values", iterate_param="period", iterate_values=years,
+            records_path="data", missing_records_is_empty=True,
+            params={"reporterCode": reporters,
                     "cmdCode": args.hs_codes or "03,0301,0302,0303,0304,0305,0306,0307",
                     "flowCode": "M,X", "partnerCode": "0", "includeDesc": "true"},
-            api_key_env="COMTRADE_API_KEY", api_key_header="Ocp-Apim-Subscription-Key",
             field_map=COMTRADE_FIELDS, table="trade_fish_by_country")
     elif s == "obis":
         cfg = SourceConfig(
@@ -388,6 +350,11 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
         value = getattr(args, attr)
         if value is not None:
             overrides[attr] = value
+    if args.weeks_from or args.weeks_to:
+        if not (args.weeks_from and args.weeks_to):
+            raise SystemExit("give both --weeks-from and --weeks-to")
+        overrides["week_from"] = parse_iso_week(args.weeks_from)
+        overrides["week_to"] = parse_iso_week(args.weeks_to)
     if args.records_path is not None:
         overrides["records_path"] = args.records_path or None  # "" means the body is the list
     if args.param:
@@ -512,7 +479,7 @@ def jsonstat_to_records(body: Any) -> list[dict] | None:
 # --------------------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------------------
-def create_session(user_agent: str, bearer_token: str | None = None) -> requests.Session:
+def create_session(user_agent: str) -> requests.Session:
     retries = Retry(
         total=5,
         connect=3,
@@ -534,8 +501,6 @@ def create_session(user_agent: str, bearer_token: str | None = None) -> requests
         "Accept": "application/json",
         "Accept-Encoding": "gzip, deflate",
     })
-    if bearer_token:
-        session.headers["Authorization"] = f"Bearer {bearer_token}"
     return session
 
 
@@ -557,32 +522,6 @@ def robots_allows(session: requests.Session, url: str, user_agent: str) -> bool:
 
 class FetchError(Exception):
     pass
-
-
-def get_oauth_token(session: requests.Session, oauth: OAuthConfig) -> str:
-    """OAuth2 client-credentials login. Raises FetchError with a readable reason."""
-    client_id = os.environ.get(oauth.client_id_env)
-    client_secret = os.environ.get(oauth.client_secret_env)
-    if not client_id or not client_secret:
-        raise FetchError(f"set {oauth.client_id_env} and {oauth.client_secret_env} "
-                         f"(register a free API client with the data provider)")
-    data = {"grant_type": "client_credentials", "client_id": client_id,
-            "client_secret": client_secret}
-    if oauth.scope:
-        data["scope"] = oauth.scope
-    try:
-        resp = session.post(oauth.token_url, data=data, timeout=DEFAULT_TIMEOUT)
-    except requests.RequestException as exc:
-        raise FetchError(f"login request failed: {exc}") from exc
-    if resp.status_code >= 400:
-        raise FetchError(f"login failed with HTTP {resp.status_code}: {resp.text[:200]!r}")
-    try:
-        token = resp.json().get("access_token")
-    except ValueError:
-        token = None
-    if not token:
-        raise FetchError("login response had no access_token")
-    return token
 
 
 def fetch_json(session: requests.Session, url: str, params: dict, *, method: str = "GET",
@@ -759,10 +698,33 @@ class WeekPaginator(Paginator):  # one request per ISO week: .../{year}/{week}
         return self.advance([], None)
 
 
+class ValuesPaginator(Paginator):  # one request per value, e.g. per year: ?period=2023
+    stop_on_empty = False  # a value with no data (e.g. a year not yet reported) is normal
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        if not cfg.iterate_param or not cfg.iterate_values:
+            raise SystemExit("values pagination needs a parameter and a list of values")
+        self.i = 0
+
+    def params(self):
+        return {self.cfg.iterate_param: self.cfg.iterate_values[self.i]}
+
+    def extra_fields(self):
+        return {}
+
+    def advance(self, raw_records, body):
+        self.i += 1
+        return self.i < len(self.cfg.iterate_values)
+
+    def skip(self):
+        return self.advance([], None)
+
+
 PAGINATORS: dict[str, type[Paginator]] = {
     "none": NoPagination, "page": PagePaginator, "offset": OffsetPaginator,
     "range": RangePaginator, "cursor": CursorPaginator, "arcgis": ArcGISPaginator,
-    "week": WeekPaginator,
+    "week": WeekPaginator, "values": ValuesPaginator,
 }
 
 
@@ -966,7 +928,7 @@ def save_outputs(df: pd.DataFrame, out_dir: Path, basename: str) -> tuple[Path, 
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
-SOURCES = ["fiskeridir", "barentswatch", "brreg", "ssb_salmon", "worldbank", "comtrade",
+SOURCES = ["fiskeridir", "brreg", "ssb_salmon", "worldbank", "comtrade",
            "obis", "arcgis", "custom"]
 
 
@@ -981,12 +943,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g = p.add_argument_group("source options")
     g.add_argument("--countries", help="worldbank: ISO3 codes separated by ';' (default NOR;ARE)")
     g.add_argument("--indicator", help="worldbank: indicator id (default ER.FSH.AQUA.MT)")
-    g.add_argument("--years", help="worldbank: 2000:2024 | comtrade: 2022,2023")
+    g.add_argument("--years", help="worldbank: 2000:2024 | comtrade: 2022,2023 or 2019:2023")
     g.add_argument("--reporters", help="comtrade: UN M49 codes, e.g. 578,784 (Norway, UAE)")
     g.add_argument("--hs-codes", help="comtrade: HS codes (default 03 and 0301-0307)")
     g.add_argument("--nace", help=f"brreg: industry codes (default {NORWAY_AQUACULTURE_NACE})")
-    g.add_argument("--weeks-from", help="barentswatch: first ISO week, e.g. 2025-W01")
-    g.add_argument("--weeks-to", help="barentswatch: last ISO week (default: last full week)")
+    g.add_argument("--weeks-from", help="week pagination: first ISO week, e.g. 2025-W01")
+    g.add_argument("--weeks-to", help="week pagination: last ISO week, e.g. 2025-W52")
     g.add_argument("--last-weeks", type=int, default=52, help="ssb_salmon: number of recent weeks")
     g.add_argument("--species", help="obis: scientific name, e.g. 'Salmo salar'")
 
@@ -1009,8 +971,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help=f"seconds between requests, minimum {MIN_DELAY_SECONDS} (default 1.5)")
     r.add_argument("--contact", default=os.environ.get("AQUA_SCRAPER_CONTACT"),
                    help="email/URL put in the User-Agent (or set AQUA_SCRAPER_CONTACT)")
-    r.add_argument("--bearer-token-env", metavar="ENV_VAR",
-                   help="name of an env var holding an API token (sent as Authorization: Bearer)")
     r.add_argument("--ignore-robots", action="store_true", help="skip the robots.txt check")
     r.add_argument("--out-dir", default=".", help="output folder (default: current folder)")
     r.add_argument("--basename", default=DEFAULT_BASENAME,
@@ -1039,26 +999,8 @@ def main(argv: list[str] | None = None) -> int:
     user_agent = (f"AquacultureDataBot/{__version__} (research data collection; "
                   f"contact: {args.contact or 'not provided'}) python-requests/{requests.__version__}")
 
-    token = None
-    if args.bearer_token_env:
-        token = os.environ.get(args.bearer_token_env)
-        if not token:
-            raise SystemExit(f"Environment variable {args.bearer_token_env} is not set")
-
-    session = create_session(user_agent, token)
-    if cfg.api_key_env and cfg.api_key_header and os.environ.get(cfg.api_key_env):
-        session.headers[cfg.api_key_header] = os.environ[cfg.api_key_env]
-    if cfg.oauth:
-        try:
-            session.headers["Authorization"] = f"Bearer {get_oauth_token(session, cfg.oauth)}"
-            log.info("Logged in to %s.", urlparse(cfg.oauth.token_url).netloc)
-        except FetchError as exc:
-            log.error("Could not log in for %s: %s", cfg.name, exc)
-            return 2
-
-    # robots.txt governs crawlers; a registered API client is governed by the API's own terms
-    check_robots = not args.ignore_robots and not cfg.oauth
-    if check_robots and not robots_allows(session, cfg.url.split("{", 1)[0], user_agent):
+    session = create_session(user_agent)
+    if not args.ignore_robots and not robots_allows(session, cfg.url.split("{", 1)[0], user_agent):
         log.error("robots.txt disallows %s for this bot. Stopping (use --ignore-robots only "
                   "if the data owner has given you permission).", cfg.url)
         return 2

@@ -1,6 +1,6 @@
 # Data schema
 
-`run_all.py` writes six linked tables to `data/`, each as `.csv` and `.json`. Every row also has two provenance columns:
+`run_all.py` writes five linked tables to `data/`, each as `.csv` and `.json`. Every row also has two provenance columns:
 
 - `source`: which source the row came from
 - `retrieved_at`: when it was downloaded (UTC)
@@ -9,7 +9,6 @@
 
 ```
 companies_norway.org_number ──< facilities_norway.org_numbers   (a site lists its licence holders' org numbers)
-facilities_norway.site_number ──< health_norway_weekly.site_number   (one row per site per week)
 
 production_by_country.country_iso3 ── trade_fish_by_country.reporter_iso3   (NOR, ARE)
 ```
@@ -24,7 +23,7 @@ One row per registered site. Categories covered: 1 (identity), 2 (species), 8 (l
 | Column | Meaning |
 |---|---|
 | `facility_id` | Register's internal site ID |
-| `site_number` | Official site number (key to `health_norway_weekly`) |
+| `site_number` | Official site number |
 | `facility_name` | Site name |
 | `species` | Permitted species (`; ` separated) |
 | `latitude`, `longitude` | Position, decimal degrees |
@@ -35,24 +34,6 @@ One row per registered site. Categories covered: 1 (identity), 2 (species), 8 (l
 | `water_type`, `placement_type` | Salt/fresh water; sea/land |
 | `municipality`, `county`, `production_area` | Location |
 | `status`, `registered_date` | Site status and clearance date |
-
-### `health_norway_weekly` — BarentsWatch Fish Health
-One row per site per week. Categories covered: 4 (sea temperature), 5 (health), 13 (weekly time series).
-
-| Column | Meaning |
-|---|---|
-| `year`, `week` | ISO week |
-| `site_number` | Site number (key to `facilities_norway`) |
-| `facility_name` | Site name |
-| `avg_adult_female_lice`, `avg_mobile_lice`, `avg_stationary_lice` | Average lice per fish |
-| `has_reported_lice` | Whether lice were reported that week |
-| `sea_temperature_c` | Reported sea temperature |
-| `has_pd`, `has_ila` | Pancreas disease / infectious salmon anaemia status |
-| `has_cleaner_fish`, `has_mechanical_removal`, `has_medicinal_treatment` | Lice treatments used |
-| `is_fallow`, `has_salmonids`, `is_on_land` | Site state |
-| `municipality`, `latitude`, `longitude` | Location |
-
-Needs a free BarentsWatch API client. Set `BW_CLIENT_ID` and `BW_CLIENT_SECRET`.
 
 ### `companies_norway` — Brønnøysund Register Centre
 One row per aquaculture company, selected by industry code (NACE 03.211, 03.212, 03.221, 03.222). Category covered: 14 (company).
@@ -102,7 +83,7 @@ One row per country × year × flow × HS product, with the world as partner. Ca
 | `net_weight_kg`, `quantity`, `quantity_unit` | Volume |
 | `trade_value_usd` | Value in US dollars |
 
-HS 03 covers wild-caught and farmed products together; trade statistics don't separate them. Without `COMTRADE_API_KEY` this uses the public preview, which is capped at 500 rows per request.
+HS 03 covers wild-caught and farmed products together; trade statistics don't separate them. It uses the keyless public preview, capped at 500 rows per request, so the scraper sends one request per year.
 
 ## Coverage of the 15 categories
 
@@ -111,11 +92,13 @@ HS 03 covers wild-caught and farmed products together; trade statistics don't se
 | 1 | Facility identity | `facilities_norway` | Not public |
 | 2 | Species & stocking | Species names only | Not public |
 | 3 | Production | National total | National total |
-| 4 | Water & environment | Weekly sea temperature per site | — |
-| 5 | Health & biosecurity | `health_norway_weekly` | Not public |
+| 4 | Water & environment | — | — |
+| 5 | Health & biosecurity | Not available without an API key | Not public |
 | 7 | Economics & market | Salmon prices, trade | Trade |
 | 8 | Regulatory | Licence numbers | — |
-| 13 | Time series | Weekly health | — |
+| 13 | Time series | Weekly salmon prices | — |
 | 14 | Company | `companies_norway` | No open register |
 
-Not covered yet: 6 (feed), 9 (traceability), 10 (research), 12 (media) and 15 (sustainability). These are mostly private or only published as PDF reports. Possible next sources: FAO FishStat (species-level production), Copernicus Marine (water conditions), certification directories (ASC/BAP), and Zenodo/OpenAlex (research).
+Norway's site-level lice and disease data is published only through the BarentsWatch API, which needs a free registered client, so it is left out to keep the project keyless.
+
+Not covered yet: 6 (feed), 9 (traceability), 10 (research), 12 (media) and 15 (sustainability). These are mostly private or only published as PDF reports. Possible keyless next sources: FAO FishStat (species-level production), NOAA ERDDAP (ocean conditions), and Zenodo/OpenAlex (research).

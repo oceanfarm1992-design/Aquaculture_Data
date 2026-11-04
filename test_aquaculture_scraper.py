@@ -8,7 +8,6 @@ import re
 import tempfile
 import threading
 import unittest
-from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -64,11 +63,6 @@ class MockAPI(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         self._count(u.path)
         body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
-        if u.path == "/token":
-            form = parse_qs(body)
-            if form.get("client_id") == ["cid"] and form.get("client_secret") == ["secret"]:
-                return self._send(200, {"access_token": "tok123", "token_type": "Bearer"})
-            return self._send(401, {"error": "invalid_client"})
         if u.path == "/ssb":
             query = json.loads(body)
             if query.get("response", {}).get("format") != "json-stat2":
@@ -140,20 +134,22 @@ class MockAPI(BaseHTTPRequestHandler):
                 body["_embedded"] = {"enheter": companies}
             return self._send(200, body)
 
-        m = re.fullmatch(r"/bw/(\d{4})/(\d{1,2})", u.path)
-        if m:  # BarentsWatch: needs the bearer token
-            if self.headers.get("Authorization") != "Bearer tok123":
-                return self._send(401, {"error": "unauthorized"})
+        m = re.fullmatch(r"/weekly/(\d{4})/(\d{1,2})", u.path)
+        if m:  # one URL per ISO week
             year, week = int(m.group(1)), int(m.group(2))
             if (year, week) == (2025, 1):
                 return self._send(200, {"year": year, "week": week})  # no reports this week
             return self._send(200, {"year": year, "week": week, "localities": [
-                {"localityNo": 12345, "name": "Testvika", "avgAdultFemaleLice": 0.21,
-                 "hasPd": False, "hasIla": False, "isFallow": False, "lat": 69.1, "lon": 18.2}]})
+                {"localityNo": 12345, "name": "Testvika", "avgAdultFemaleLice": 0.21}]})
 
-        if u.path == "/comtrade":
-            if self.headers.get("Ocp-Apim-Subscription-Key") != "k":
-                return self._send(200, {"data": [], "error": "missing subscription key"})
+        if u.path == "/comtrade-error":
+            return self._send(200, {"data": [], "error": "invalid parameter"})
+
+        if u.path == "/comtrade":  # keyless preview: one year per request
+            if "," in q["period"] or q.get("reporterCode") != "578,784":
+                return self._send(400, {"error": "bad query"})
+            if q["period"] != "2023":
+                return self._send(200, {"count": 0, "error": "", "data": []})
             return self._send(200, {"count": 2, "error": "", "data": [
                 {"refYear": 2023, "reporterCode": 784, "reporterISO": "ARE", "reporterDesc": "United Arab Emirates",
                  "flowCode": "M", "flowDesc": "Import", "partnerCode": 0, "partnerDesc": "World",
@@ -289,26 +285,18 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(res.records[0]["address"], "Kaia 1; Bygg B")
         self.assertEqual(res.records[0]["org_number"], "900000000")
 
-    def test_barentswatch_oauth_and_weeks(self):
-        cfg = self.preset("--source", "barentswatch", "--weeks-from", "2024-W52", "--weeks-to", "2025-W02")
-        cfg = replace(cfg, url=self.base + "/bw/{year}/{week}",
-                      oauth=replace(cfg.oauth, token_url=self.base + "/token"))
-        session = aq.create_session("TestBot/1.0")
-        with mock.patch.dict(os.environ, {"BW_CLIENT_ID": "cid", "BW_CLIENT_SECRET": "secret"}):
-            session.headers["Authorization"] = "Bearer " + aq.get_oauth_token(session, cfg.oauth)
-        res = self.run_scrape(cfg, session=session)
+    def test_week_pagination(self):
+        cfg = self.preset("--source", "custom", "--url", self.base + "/weekly/{year}/{week}",
+                          "--pagination", "week", "--records-path", "localities",
+                          "--weeks-from", "2024-W52", "--weeks-to", "2025-W02", "--id-field", "")
+        cfg = aq.replace(cfg, missing_records_is_empty=True, id_field=None)
+        res = self.run_scrape(cfg)
         self.assertEqual(res.pages_failed, 0)
+        self.assertEqual(MockAPI.hits.get("/weekly/2025/1"), 1)   # empty week did not stop the run
         self.assertEqual([(r["year"], r["week"]) for r in res.records], [(2024, 52), (2025, 2)])
-        self.assertEqual(res.records[0]["site_number"], 12345)
-        self.assertEqual(res.records[0]["avg_adult_female_lice"], 0.21)
 
-    def test_oauth_bad_credentials(self):
-        oauth = aq.OAuthConfig(token_url=self.base + "/token", client_id_env="X_ID", client_secret_env="X_SECRET")
-        with mock.patch.dict(os.environ, {"X_ID": "cid", "X_SECRET": "wrong"}):
-            with self.assertRaises(aq.FetchError):
-                aq.get_oauth_token(self.session, oauth)
-        with self.assertRaises(aq.FetchError):  # env vars not set
-            aq.get_oauth_token(self.session, replace(oauth, client_id_env="NOPE_ID"))
+    def test_parse_years(self):
+        self.assertEqual(aq.parse_years("2019:2021,2023"), ["2019", "2020", "2021", "2023"])
 
     def test_ssb_post_jsonstat(self):
         cfg = self.preset("--source", "ssb_salmon", "--url", self.base + "/ssb")
@@ -317,21 +305,22 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(res.records[2], {"period": "2025U01", "product_code": "01", "product": "Fresh salmon",
                                           "measure_code": "Kilopris", "measure": "Price (NOK/kg)", "value": 85.5})
 
-    def test_comtrade_with_api_key_end_to_end(self):
-        with tempfile.TemporaryDirectory() as out, mock.patch.dict(os.environ, {"COMTRADE_API_KEY": "k"}):
+    def test_comtrade_keyless_one_request_per_year_end_to_end(self):
+        with tempfile.TemporaryDirectory() as out:
             code = aq.main(["--source", "comtrade", "--url", self.base + "/comtrade", "--delay", "1",
-                            "--out-dir", out, "--basename", "trade"])
+                            "--years", "2022:2023", "--out-dir", out, "--basename", "trade"])
             self.assertEqual(code, 0)
             df = pd.read_csv(Path(out) / "trade.csv")
+        self.assertEqual(MockAPI.hits["/comtrade"], 2)       # 2022 (empty) and 2023
+        self.assertNotIn("Authorization", MockAPI.last_headers)
         self.assertEqual(list(df["reporter_iso3"]), ["ARE", "NOR"])
         self.assertEqual(df.loc[1, "trade_value_usd"], 8.0e9)
         self.assertIn("UN Comtrade", df.loc[0, "source"])   # provenance columns
         self.assertIn("retrieved_at", df.columns)
 
     def test_comtrade_error_string(self):
-        cfg = self.preset("--source", "comtrade", "--url", self.base + "/comtrade")
-        res = self.run_scrape(cfg)  # no key header -> API reports an error in the body
-        self.assertEqual(res.pages_failed, 1)
+        cfg = self.preset("--source", "comtrade", "--url", self.base + "/comtrade-error", "--years", "2023")
+        self.assertEqual(self.run_scrape(cfg).pages_failed, 1)
 
     def test_end_to_end_cli_writes_csv_and_json(self):
         with tempfile.TemporaryDirectory() as out:
@@ -346,15 +335,16 @@ class ScraperTests(unittest.TestCase):
             self.assertIn("location.lat", csv_df.columns)  # json_normalize flattening
             self.assertIn("operator.company_name", data[0])
 
-    def test_run_all_skips_jobs_without_credentials(self):
-        env = {k: v for k, v in os.environ.items() if k not in ("BW_CLIENT_ID", "BW_CLIENT_SECRET")}
-        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(aq, "main") as fake_main:
-            code = run_all.main(["--only", "health_norway_weekly"])
+    def test_run_all_needs_no_keys(self):
+        """Every table builds with an environment that has no keys or tokens at all."""
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(aq, "main", return_value=0) as fake_main:
+            code = run_all.main([])
         self.assertEqual(code, 0)
-        fake_main.assert_not_called()
+        self.assertEqual(fake_main.call_count, len(run_all.JOBS))
 
     def test_every_run_all_job_parses(self):
-        for table, (job_args, _, _) in run_all.JOBS.items():
+        for table, (job_args, _) in run_all.JOBS.items():
             cfg = aq.build_source(aq.parse_args(job_args))
             self.assertEqual(cfg.table, table, f"{table} preset has a different table name")
 

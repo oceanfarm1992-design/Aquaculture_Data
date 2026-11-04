@@ -6,8 +6,8 @@ run_all.py — build every linked table for Norway and the UAE into one folder.
     python run_all.py --contact you@example.org --only production_by_country trade_fish_by_country
     python run_all.py --list                                 # show the tables
 
-Tables and how they link are described in SCHEMA.md. A source that needs credentials
-is skipped (with a message) when its environment variables are not set.
+Tables and how they link are described in SCHEMA.md. Every source is open:
+no API key, account or login is needed.
 """
 from __future__ import annotations
 
@@ -19,19 +19,17 @@ import time
 
 import aquaculture_scraper as aq
 
-# table name -> (scraper arguments, env vars that must be set, description)
-JOBS: dict[str, tuple[list[str], list[str], str]] = {
-    "facilities_norway": (["--source", "fiskeridir"], [],
+# table name -> (scraper arguments, description)
+JOBS: dict[str, tuple[list[str], str]] = {
+    "facilities_norway": (["--source", "fiskeridir"],
                           "Norway: every registered fish-farm site"),
-    "companies_norway": (["--source", "brreg"], [],
+    "companies_norway": (["--source", "brreg"],
                          "Norway: aquaculture companies (company register)"),
-    "health_norway_weekly": (["--source", "barentswatch"], ["BW_CLIENT_ID", "BW_CLIENT_SECRET"],
-                             "Norway: weekly lice, disease and treatments per site (last 52 weeks)"),
-    "prices_norway_salmon_export": (["--source", "ssb_salmon", "--last-weeks", "104"], [],
+    "prices_norway_salmon_export": (["--source", "ssb_salmon", "--last-weeks", "104"],
                                     "Norway: weekly salmon export volume and price"),
-    "production_by_country": (["--source", "worldbank", "--countries", "NOR;ARE"], [],
+    "production_by_country": (["--source", "worldbank", "--countries", "NOR;ARE"],
                               "Norway + UAE: aquaculture production, tonnes per year"),
-    "trade_fish_by_country": (["--source", "comtrade", "--reporters", "578,784"], [],
+    "trade_fish_by_country": (["--source", "comtrade", "--reporters", "578,784"],
                               "Norway + UAE: fish and seafood imports/exports (HS 03)"),
 }
 
@@ -52,9 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("run_all")
 
     if args.list:
-        for table, (_, env, desc) in JOBS.items():
-            needs = f"  [needs {', '.join(env)}]" if env else ""
-            print(f"{table:30s} {desc}{needs}")
+        for table, (_, desc) in JOBS.items():
+            print(f"{table:30s} {desc}")
         return 0
 
     common = ["--out-dir", args.out_dir, "--delay", str(args.delay)]
@@ -63,12 +60,7 @@ def main(argv: list[str] | None = None) -> int:
 
     results: dict[str, str] = {}
     for table in args.only or JOBS:
-        job_args, env, desc = JOBS[table]
-        missing = [e for e in env if not os.environ.get(e)]
-        if missing:
-            log.warning("Skipping %s: set %s first (see README).", table, ", ".join(missing))
-            results[table] = "skipped (no credentials)"
-            continue
+        job_args, desc = JOBS[table]
         log.info("=== %s — %s ===", table, desc)
         started = time.monotonic()
         try:
@@ -85,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
     log.info("=== Summary (output in %s/) ===", args.out_dir)
     for table, status in results.items():
         log.info("%-30s %s", table, status)
-    return 0 if all(s.startswith(("ok", "skipped")) for s in results.values()) else 1
+    return 0 if all(s.startswith("ok") for s in results.values()) else 1
 
 
 if __name__ == "__main__":
