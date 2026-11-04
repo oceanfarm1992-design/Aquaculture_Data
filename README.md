@@ -107,8 +107,8 @@ Exit codes: `0` success, `1` partial (some pages failed or interrupted), `2` no 
 
 ## Automated runs (GitHub Actions)
 
-- **Tests** (`.github/workflows/tests.yml`): runs all offline tests on Python 3.10, 3.12 and 3.13 on every push to `main` and every pull request.
-- **Scrape data** (`.github/workflows/scrape.yml`): runs `run_all.py` every Monday at 03:17 UTC, and whenever you start it by hand. It archives every run as a GitHub Release and, if Supabase is set up, loads the tables into your database (see [How data is kept](#how-data-is-kept)).
+- **Tests** (`.github/workflows/tests.yml`): runs all offline tests on Python 3.11, 3.12, 3.13 and 3.14 on every push to `main` and every pull request.
+- **Scrape data** (`.github/workflows/scrape.yml`): builds every table every Monday at 03:17 UTC, refreshes news and research on the other days at 05:43 UTC, and runs whenever you start it by hand. It archives every run as a GitHub Release and, if Supabase is set up, loads the tables into your database (see [How data is kept](#how-data-is-kept)).
 
 To run a scrape now:
 
@@ -119,6 +119,12 @@ To run a scrape now:
 Optional: add a repository variable `SCRAPER_CONTACT` with your email or website (Settings → Secrets and variables → Actions → Variables). It is sent in the User-Agent so data owners can reach you. It is not a key, and the scrape runs without it.
 
 A run is marked failed if any table fails or is only partly collected; the files that were collected are still uploaded.
+
+## Staying up to date
+
+- **Data:** news and research refresh daily, and every other table weekly. FAO publishes a new release once a year; the scraper finds the newest one by itself.
+- **Libraries and actions:** `requirements.txt` pins exact versions, so every run uses a tested set. Each Tuesday, [Dependabot](.github/dependabot.yml) checks for new versions of the Python libraries and GitHub Actions and opens a pull request. The **Dependabot auto-merge** workflow tests it on Python 3.11 and 3.14 and merges minor and patch updates when the tests pass. Major updates get a comment and wait for you.
+- **When something breaks:** if a source changes its format, that table's step fails and GitHub emails you about the failed scheduled run. Paste the log into a new session to get it fixed.
 
 ## Storing data in Supabase
 
