@@ -7,3 +7,6 @@ venv/
 aquaculture_data.csv
 aquaculture_data.json
 *.tmp
+
+# run_all.py output folder
+data/

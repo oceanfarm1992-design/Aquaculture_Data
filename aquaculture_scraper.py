@@ -1,47 +1,58 @@
 #!/usr/bin/env python3
 """
-aquaculture_scraper.py — polite, fault-tolerant scraper for aquaculture JSON APIs.
+aquaculture_scraper.py — polite, fault-tolerant scraper for aquaculture data APIs.
 
-Writes a clean, flat dataset to:
+Run one source with --source. By default each run writes:
     aquaculture_data.csv   (UTF-8)
     aquaculture_data.json  (array of records, UTF-8)
+To build every linked table at once (Norway + UAE), use run_all.py; see SCHEMA.md.
 
-Built-in sources (choose with --source):
+Sources (--source):
 
-  fiskeridir  Norwegian Directorate of Fisheries, Aquaculture Register (open, no key).
-              Every registered fish-farm site: name, species, lat/lon, capacity,
-              licence holder (company), municipality / county / production area.
-              https://api.fiskeridir.no/pub-aqua/api/v1/sites
+  Norway — facility level
+    fiskeridir     Aquaculture Register: every fish-farm site (name, species, lat/lon,
+                   capacity, licence holder). Open, no key.
+    barentswatch   Weekly fish health per site: sea lice, PD/ILA disease, treatments,
+                   fallowing, sea temperature. Needs a free BarentsWatch API client
+                   (env BW_CLIENT_ID and BW_CLIENT_SECRET).
+    brreg          Brønnøysund company register: aquaculture companies by industry code
+                   (org number, name, employees, address, founding date). Open, no key.
+    ssb_salmon     Statistics Norway table 03024: weekly export volume and price of
+                   farmed salmon. Open, no key.
 
-  obis        OBIS (Ocean Biodiversity Information System) occurrence records for one
-              species, e.g. a farmed species: --species "Salmo salar".
-              https://api.obis.org/v3/occurrence  (cursor pagination)
+  Any country — national level (default: Norway + UAE)
+    worldbank      Aquaculture production in tonnes per country per year
+                   (World Bank indicator ER.FSH.AQUA.MT, sourced from FAO). Open, no key.
+    comtrade       UN Comtrade fish and seafood trade (HS chapter 03) per country,
+                   year, flow and product. Works without a key (preview, max 500 rows);
+                   set COMTRADE_API_KEY for the full API.
 
-  arcgis      Any ArcGIS REST FeatureServer/MapServer layer, e.g. the FAO or a national
-              aquaculture-site layer: --url ".../FeatureServer/0"
-              (paged with resultOffset/resultRecordCount)
-
-  custom      Any JSON API: set --url, --pagination, --records-path, and optionally
-              --field-map (a JSON file mapping output columns to field paths).
+  Generic
+    obis           OBIS species occurrence records, e.g. --species "Sparus aurata".
+    arcgis         Any ArcGIS REST map layer: --url ".../FeatureServer/0".
+    custom         Any JSON API: --url, --pagination, --records-path, --field-map.
 
 Field paths use dot notation with list support:
-    "placement.countyName"          nested key
-    "connections[0].licenseNr"      first item of a list
-    "species[*].name"               every item of a list (values are joined with "; ")
+    "placement.countyName"      nested key
+    "connections[0].licenseNr"  first item of a list
+    "species[*].name"           every item of a list (values joined with "; ")
 
 Run with --raw first on a new source. It keeps every field (flattened with
 pandas.json_normalize), which shows you the real field names to map.
 
 Examples:
     python aquaculture_scraper.py --source fiskeridir --contact you@example.org
-    python aquaculture_scraper.py --source obis --species "Sparus aurata" --max-pages 5
-    python aquaculture_scraper.py --source arcgis --url "https://<host>/arcgis/rest/services/<svc>/FeatureServer/0" --param "where=COUNTRY='NO'"
+    python aquaculture_scraper.py --source worldbank --countries "NOR;ARE" --years 2000:2024
+    python aquaculture_scraper.py --source comtrade --reporters 578,784 --years 2022,2023
+    python aquaculture_scraper.py --source barentswatch --weeks-from 2025-W01 --weeks-to 2025-W52
+    python aquaculture_scraper.py --source ssb_salmon --last-weeks 104
     python aquaculture_scraper.py --source custom --url https://api.example.org/v1/farms \\
         --pagination page --records-path data --field-map my_fields.json
 """
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import logging
 import os
@@ -51,6 +62,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -61,33 +73,57 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 log = logging.getLogger("aquaculture_scraper")
 
 MIN_DELAY_SECONDS = 1.0
 DEFAULT_TIMEOUT = (10, 30)  # (connect, read) seconds
 RETRY_STATUSES = (429, 500, 502, 503, 504)
+DEFAULT_BASENAME = "aquaculture_data"
 
 # Output column -> candidate field paths. The first path that resolves to a value is used.
 FieldMap = dict[str, list[str]]
+
+COUNTRY_CODES = {  # ISO3 -> UN M49 code (used by UN Comtrade)
+    "NOR": "578", "ARE": "784",
+}
 
 
 # --------------------------------------------------------------------------------------
 # Source configuration
 # --------------------------------------------------------------------------------------
 @dataclass
+class OAuthConfig:
+    token_url: str
+    client_id_env: str
+    client_secret_env: str
+    scope: str | None = None
+
+
+@dataclass
 class SourceConfig:
     name: str
-    url: str
-    pagination: str  # "page" | "offset" | "range" | "cursor" | "arcgis" | "none"
-    records_path: str | None = None  # path to the record list in the body; None = body is the list
+    url: str  # may contain {year}/{week} placeholders for week pagination
+    pagination: str  # "page" | "offset" | "range" | "cursor" | "arcgis" | "week" | "none"
+    records_path: str | None = None  # path to the record list; None = body is the list
     page_size: int = 100
     params: dict[str, Any] = field(default_factory=dict)
     field_map: FieldMap | None = None  # None = keep every field (json_normalize)
     id_field: str | None = None  # used for de-duplication and cursor pagination
-    total_path: str | None = None  # optional path to a "total records" count, used for progress logs
-    transform: Callable[[dict], dict] | None = None  # optional per-record pre-processing
+    total_path: str | None = None  # path to a "total records" count, for progress logs
+    pages_path: str | None = None  # path to a "total pages" count; stops page pagination
+    missing_records_is_empty: bool = False  # a missing record list means "no more data"
+    transform: Callable[[dict], dict] | None = None  # per-record pre-processing
+    parser: str = "records"  # "records" | "jsonstat" (JSON-stat 2.0 cube -> rows)
+    method: str = "GET"
+    json_body: dict | None = None  # request body for POST APIs
+    api_key_env: str | None = None  # env var holding an API key ...
+    api_key_header: str | None = None  # ... sent in this header
+    oauth: OAuthConfig | None = None  # client-credentials login before scraping
+    week_from: tuple[int, int] | None = None  # ISO (year, week), for week pagination
+    week_to: tuple[int, int] | None = None
+    table: str = DEFAULT_BASENAME  # table name used by run_all.py / SCHEMA.md
     # Query-parameter names used by the paginators
     page_param: str = "page"
     size_param: str = "per_page"
@@ -120,6 +156,8 @@ FISKERIDIR_FIELDS: FieldMap = {
     "capacity_unit": ["capacityUnitType", "capacityUnit"],
     "company": ["connections[*].legalEntityName", "connections[*].ownerName",
                 "connections[*].licenseHolder.name", "ownerName", "companyName"],
+    "org_numbers": ["connections[*].legalEntityNr", "connections[*].orgNr",
+                    "connections[*].organizationNumber", "connections[*].licenseHolder.orgNr"],
     "license_numbers": ["connections[*].licenseNr", "connections[*].licenseNumber"],
     "water_type": ["waterType", "waterEnvironment"],
     "placement_type": ["placementType", "placement.placementType"],
@@ -128,6 +166,83 @@ FISKERIDIR_FIELDS: FieldMap = {
     "production_area": ["placement.prodAreaName", "productionAreaName", "prodAreaName"],
     "status": ["status", "siteStatus"],
     "registered_date": ["firstClearanceTime", "registeredDate", "clearanceDate"],
+}
+
+BARENTSWATCH_FIELDS: FieldMap = {
+    "site_number": ["localityNo", "localityNumber"],
+    "facility_name": ["name", "localityName"],
+    "avg_adult_female_lice": ["avgAdultFemaleLice"],
+    "avg_mobile_lice": ["avgMobileLice"],
+    "avg_stationary_lice": ["avgStationaryLice"],
+    "has_reported_lice": ["hasReportedLice"],
+    "sea_temperature_c": ["seaTemperature"],
+    "is_fallow": ["isFallow"],
+    "has_pd": ["hasPd"],
+    "has_ila": ["hasIla"],
+    "has_cleaner_fish": ["hasCleanerfishDeployed"],
+    "has_mechanical_removal": ["hasMechanicalRemoval"],
+    "has_medicinal_treatment": ["hasSubstanceTreatments"],
+    "has_salmonids": ["hasSalmonoids"],
+    "is_on_land": ["isOnLand"],
+    "municipality": ["municipality"],
+    "latitude": ["lat", "latitude"],
+    "longitude": ["lon", "longitude"],
+}
+
+BRREG_FIELDS: FieldMap = {
+    "org_number": ["organisasjonsnummer"],
+    "company_name": ["navn"],
+    "legal_form": ["organisasjonsform.beskrivelse", "organisasjonsform.kode"],
+    "nace_code": ["naeringskode1.kode"],
+    "nace_description": ["naeringskode1.beskrivelse"],
+    "employees": ["antallAnsatte"],
+    "founded_date": ["stiftelsesdato"],
+    "registered_date": ["registreringsdatoEnhetsregisteret"],
+    "website": ["hjemmeside"],
+    "address": ["forretningsadresse.adresse[*]"],
+    "postcode": ["forretningsadresse.postnummer"],
+    "city": ["forretningsadresse.poststed"],
+    "municipality": ["forretningsadresse.kommune"],
+    "country": ["forretningsadresse.land"],
+    "parent_org_number": ["overordnetEnhet"],
+    "bankrupt": ["konkurs"],
+    "under_liquidation": ["underAvvikling"],
+}
+
+WORLDBANK_FIELDS: FieldMap = {
+    "country_iso3": ["countryiso3code"],
+    "country": ["country.value"],
+    "year": ["date"],
+    "indicator_id": ["indicator.id"],
+    "indicator": ["indicator.value"],
+    "value": ["value"],
+    "unit": ["unit"],
+}
+
+COMTRADE_FIELDS: FieldMap = {
+    "year": ["refYear", "period"],
+    "reporter_code": ["reporterCode"],
+    "reporter_iso3": ["reporterISO"],
+    "reporter": ["reporterDesc"],
+    "flow_code": ["flowCode"],
+    "flow": ["flowDesc"],
+    "partner_code": ["partnerCode"],
+    "partner": ["partnerDesc"],
+    "hs_code": ["cmdCode"],
+    "commodity": ["cmdDesc"],
+    "net_weight_kg": ["netWgt"],
+    "quantity": ["qty"],
+    "quantity_unit": ["qtyUnitAbbr"],
+    "trade_value_usd": ["primaryValue"],
+}
+
+SSB_SALMON_FIELDS: FieldMap = {
+    "period": ["Tid"],
+    "product_code": ["VareGrupper2"],
+    "product": ["VareGrupper2_label"],
+    "measure_code": ["ContentsCode"],
+    "measure": ["ContentsCode_label"],
+    "value": ["value"],
 }
 
 OBIS_FIELDS: FieldMap = {
@@ -145,50 +260,120 @@ OBIS_FIELDS: FieldMap = {
     "institution": ["institutionCode", "ownerInstitutionCode"],
 }
 
+# Norwegian industry codes (SN2007) for fish farming: sea food fish, sea juveniles,
+# freshwater food fish, freshwater juveniles. Override with --nace if the register changes.
+NORWAY_AQUACULTURE_NACE = "03.211,03.212,03.221,03.222"
+
+
+def parse_iso_week(text: str) -> tuple[int, int]:
+    """Parse '2025-W07' or '2025-7' into (2025, 7)."""
+    m = re.fullmatch(r"(\d{4})-?W?(\d{1,2})", text.strip(), flags=re.IGNORECASE)
+    if not m:
+        raise SystemExit(f"Week must look like 2025-W07, got {text!r}")
+    year, week = int(m.group(1)), int(m.group(2))
+    try:
+        date.fromisocalendar(year, week, 1)
+    except ValueError as exc:
+        raise SystemExit(f"{text!r} is not a valid ISO week") from exc
+    return year, week
+
+
+def next_iso_week(year: int, week: int) -> tuple[int, int]:
+    y, w, _ = (date.fromisocalendar(year, week, 1) + timedelta(weeks=1)).isocalendar()
+    return y, w
+
 
 def build_source(args: argparse.Namespace) -> SourceConfig:
     """Build the SourceConfig for the chosen preset, then apply CLI overrides."""
-    if args.source == "fiskeridir":
+    s = args.source
+    if s == "fiskeridir":
         cfg = SourceConfig(
             name="Fiskeridirektoratet Aquaculture Register",
             url="https://api.fiskeridir.no/pub-aqua/api/v1/sites",
-            pagination="range",
-            records_path=None,
-            page_size=100,
-            field_map=FISKERIDIR_FIELDS,
-            id_field="siteId",
-        )
-    elif args.source == "obis":
+            pagination="range", page_size=100, field_map=FISKERIDIR_FIELDS,
+            id_field="siteId", table="facilities_norway")
+    elif s == "barentswatch":
+        last_full_week = (date.today() - timedelta(weeks=1)).isocalendar()
+        week_to = parse_iso_week(args.weeks_to) if args.weeks_to else (last_full_week[0], last_full_week[1])
+        if args.weeks_from:
+            week_from = parse_iso_week(args.weeks_from)
+        else:
+            y, w, _ = (date.fromisocalendar(*week_to, 1) - timedelta(weeks=51)).isocalendar()
+            week_from = (y, w)
         cfg = SourceConfig(
-            name="OBIS occurrences",
-            url="https://api.obis.org/v3/occurrence",
-            pagination="cursor",
-            records_path="results",
-            page_size=1000,  # OBIS accepts up to 10000
-            params={"scientificname": args.species or "Salmo salar"},
-            field_map=OBIS_FIELDS,
-            id_field="id",
-            total_path="total",
-            size_param="size",
-            cursor_param="after",
-        )
-    elif args.source == "arcgis":
+            name="BarentsWatch Fish Health",
+            url="https://www.barentswatch.no/bwapi/v1/geodata/fishhealth/{year}/{week}",
+            pagination="week", records_path="localities", field_map=BARENTSWATCH_FIELDS,
+            missing_records_is_empty=True, week_from=week_from, week_to=week_to,
+            oauth=OAuthConfig(token_url="https://id.barentswatch.no/connect/token",
+                              client_id_env="BW_CLIENT_ID", client_secret_env="BW_CLIENT_SECRET",
+                              scope="api"),
+            table="health_norway_weekly")
+    elif s == "brreg":
+        cfg = SourceConfig(
+            name="Brønnøysund Register Centre (Enhetsregisteret)",
+            url="https://data.brreg.no/enhetsregisteret/api/enheter",
+            pagination="page", page_param="page", size_param="size", page_start=0,
+            page_size=100, params={"naeringskode": args.nace or NORWAY_AQUACULTURE_NACE},
+            records_path="_embedded.enheter", pages_path="page.totalPages",
+            total_path="page.totalElements", missing_records_is_empty=True,
+            field_map=BRREG_FIELDS, id_field="organisasjonsnummer", table="companies_norway")
+    elif s == "ssb_salmon":
+        cfg = SourceConfig(
+            name="Statistics Norway table 03024 (salmon exports)",
+            url="https://data.ssb.no/api/v0/en/table/03024",
+            pagination="none", method="POST", parser="jsonstat",
+            json_body={
+                "query": [
+                    {"code": "VareGrupper2", "selection": {"filter": "item", "values": ["01", "02"]}},
+                    {"code": "ContentsCode", "selection": {"filter": "item", "values": ["Vekt", "Kilopris"]}},
+                    {"code": "Tid", "selection": {"filter": "top", "values": [str(args.last_weeks)]}},
+                ],
+                "response": {"format": "json-stat2"},
+            },
+            field_map=SSB_SALMON_FIELDS, table="prices_norway_salmon_export")
+    elif s == "worldbank":
+        countries = args.countries or "NOR;ARE"
+        indicator = args.indicator or "ER.FSH.AQUA.MT"
+        cfg = SourceConfig(
+            name=f"World Bank WDI {indicator} (FAO data)",
+            url=f"https://api.worldbank.org/v2/country/{countries}/indicator/{indicator}",
+            pagination="page", page_size=1000, records_path="[1]", pages_path="[0].pages",
+            total_path="[0].total", missing_records_is_empty=True,
+            params={"format": "json", "date": args.years or "2000:2024"},
+            field_map=WORLDBANK_FIELDS, table="production_by_country")
+    elif s == "comtrade":
+        reporters = args.reporters or ",".join(COUNTRY_CODES.values())
+        years = (args.years or ",".join(str(y) for y in range(date.today().year - 6, date.today().year - 1)))
+        key_set = bool(os.environ.get("COMTRADE_API_KEY"))
+        cfg = SourceConfig(
+            name="UN Comtrade" + ("" if key_set else " (public preview)"),
+            url=("https://comtradeapi.un.org/data/v1/get/C/A/HS" if key_set
+                 else "https://comtradeapi.un.org/public/v1/preview/C/A/HS"),
+            pagination="none", records_path="data",
+            params={"reporterCode": reporters, "period": years.replace(":", ","),
+                    "cmdCode": args.hs_codes or "03,0301,0302,0303,0304,0305,0306,0307",
+                    "flowCode": "M,X", "partnerCode": "0", "includeDesc": "true"},
+            api_key_env="COMTRADE_API_KEY", api_key_header="Ocp-Apim-Subscription-Key",
+            field_map=COMTRADE_FIELDS, table="trade_fish_by_country")
+    elif s == "obis":
+        cfg = SourceConfig(
+            name="OBIS occurrences", url="https://api.obis.org/v3/occurrence",
+            pagination="cursor", records_path="results", page_size=1000,
+            params={"scientificname": args.species or "Salmo salar"}, field_map=OBIS_FIELDS,
+            id_field="id", total_path="total", size_param="size", cursor_param="after",
+            table="species_occurrences")
+    elif s == "arcgis":
         if not args.url:
             raise SystemExit("--source arcgis needs --url (a FeatureServer/MapServer layer URL)")
         url = args.url.rstrip("/")
         if not url.endswith("/query"):
             url += "/query"
         cfg = SourceConfig(
-            name="ArcGIS REST layer",
-            url=url,
-            pagination="arcgis",
-            records_path="features",
-            page_size=1000,
-            params={"where": "1=1", "outFields": "*", "returnGeometry": "true",
-                    "outSR": "4326", "f": "json"},
-            transform=_arcgis_feature_to_record,
-            id_field="OBJECTID",
-        )
+            name="ArcGIS REST layer", url=url, pagination="arcgis", records_path="features",
+            page_size=1000, params={"where": "1=1", "outFields": "*", "returnGeometry": "true",
+                                    "outSR": "4326", "f": "json"},
+            transform=_arcgis_feature_to_record, id_field="OBJECTID", table="map_layer")
     else:  # custom
         if not args.url:
             raise SystemExit("--source custom needs --url")
@@ -196,7 +381,7 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
                            records_path="data", id_field="id")
 
     overrides: dict[str, Any] = {}
-    if args.url and args.source in ("fiskeridir", "obis", "custom"):
+    if args.url and s not in ("arcgis",):
         overrides["url"] = args.url
     for attr in ("pagination", "page_size", "id_field", "page_param", "size_param",
                  "offset_param", "cursor_param"):
@@ -294,6 +479,36 @@ def apply_field_map(record: dict, field_map: FieldMap) -> dict:
     return out
 
 
+def jsonstat_to_records(body: Any) -> list[dict] | None:
+    """Turn a JSON-stat 2.0 dataset (used by SSB, Eurostat and other statistics offices)
+    into long-format rows: one row per cell, with each dimension's code and label."""
+    if not isinstance(body, dict) or "id" not in body or "dimension" not in body:
+        return None
+    ids, values = body["id"], body.get("value", [])
+    categories = []
+    for dim in ids:
+        cat = body["dimension"][dim].get("category", {})
+        index, labels = cat.get("index"), cat.get("label", {})
+        if index is None:
+            codes = list(labels)
+        elif isinstance(index, list):
+            codes = index
+        else:
+            codes = sorted(index, key=index.get)
+        categories.append([(code, labels.get(code, code)) for code in codes])
+    records = []
+    for flat, combo in enumerate(itertools.product(*categories)):
+        value = values.get(str(flat)) if isinstance(values, dict) else (
+            values[flat] if flat < len(values) else None)
+        row: dict[str, Any] = {}
+        for dim, (code, label) in zip(ids, combo):
+            row[dim] = code
+            row[f"{dim}_label"] = label
+        row["value"] = value
+        records.append(row)
+    return records
+
+
 # --------------------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------------------
@@ -305,7 +520,8 @@ def create_session(user_agent: str, bearer_token: str | None = None) -> requests
         backoff_factor=1.5,          # waits about 0s, 3s, 6s, 12s, 24s between attempts
         backoff_jitter=0.5,
         status_forcelist=RETRY_STATUSES,
-        allowed_methods=frozenset({"GET", "HEAD"}),
+        # POST is included because the POST APIs used here are read-only queries
+        allowed_methods=frozenset({"GET", "HEAD", "POST"}),
         respect_retry_after_header=True,  # honour 429/503 Retry-After from the server
         raise_on_status=False,       # return the last response so we can log it
     )
@@ -343,10 +559,37 @@ class FetchError(Exception):
     pass
 
 
-def fetch_json(session: requests.Session, url: str, params: dict, timeout=DEFAULT_TIMEOUT) -> Any:
-    """GET a URL and decode JSON. Raises FetchError with a readable reason on any failure."""
+def get_oauth_token(session: requests.Session, oauth: OAuthConfig) -> str:
+    """OAuth2 client-credentials login. Raises FetchError with a readable reason."""
+    client_id = os.environ.get(oauth.client_id_env)
+    client_secret = os.environ.get(oauth.client_secret_env)
+    if not client_id or not client_secret:
+        raise FetchError(f"set {oauth.client_id_env} and {oauth.client_secret_env} "
+                         f"(register a free API client with the data provider)")
+    data = {"grant_type": "client_credentials", "client_id": client_id,
+            "client_secret": client_secret}
+    if oauth.scope:
+        data["scope"] = oauth.scope
     try:
-        resp = session.get(url, params=params, timeout=timeout)
+        resp = session.post(oauth.token_url, data=data, timeout=DEFAULT_TIMEOUT)
+    except requests.RequestException as exc:
+        raise FetchError(f"login request failed: {exc}") from exc
+    if resp.status_code >= 400:
+        raise FetchError(f"login failed with HTTP {resp.status_code}: {resp.text[:200]!r}")
+    try:
+        token = resp.json().get("access_token")
+    except ValueError:
+        token = None
+    if not token:
+        raise FetchError("login response had no access_token")
+    return token
+
+
+def fetch_json(session: requests.Session, url: str, params: dict, *, method: str = "GET",
+               json_body: dict | None = None, timeout=DEFAULT_TIMEOUT) -> Any:
+    """Send a request and decode JSON. Raises FetchError with a readable reason on any failure."""
+    try:
+        resp = session.request(method, url, params=params, json=json_body, timeout=timeout)
     except requests.exceptions.RetryError as exc:
         raise FetchError(f"gave up after retries: {exc}") from exc
     except requests.RequestException as exc:
@@ -360,10 +603,15 @@ def fetch_json(session: requests.Session, url: str, params: dict, timeout=DEFAUL
         ctype = resp.headers.get("Content-Type", "?")
         raise FetchError(f"response was not valid JSON (Content-Type: {ctype}): "
                          f"{resp.text[:200]!r}") from exc
-    # ArcGIS and some other APIs report errors inside an HTTP 200 body
-    if isinstance(body, dict) and isinstance(body.get("error"), dict):
+    # Some APIs report errors inside an HTTP 200 body
+    if isinstance(body, dict) and isinstance(body.get("error"), dict):  # ArcGIS
         err = body["error"]
         raise FetchError(f"API error {err.get('code')}: {err.get('message')} {err.get('details') or ''}")
+    if isinstance(body, dict) and isinstance(body.get("error"), str) and body["error"].strip():  # Comtrade
+        raise FetchError(f"API error: {body['error']}")
+    if (isinstance(body, list) and len(body) == 1 and isinstance(body[0], dict)
+            and "message" in body[0]):  # World Bank
+        raise FetchError(f"API error: {body[0]['message']}")
     return body
 
 
@@ -373,6 +621,7 @@ def fetch_json(session: requests.Session, url: str, params: dict, timeout=DEFAUL
 class Paginator:
     """Each paginator returns the query params for the current page and moves forward."""
     can_skip_failed_page = True
+    stop_on_empty = True  # an empty page means the end of the data
 
     def __init__(self, cfg: SourceConfig):
         self.cfg = cfg
@@ -380,13 +629,21 @@ class Paginator:
     def params(self) -> dict:
         return {}
 
+    def path_vars(self) -> dict:
+        """Values for {placeholders} in the URL."""
+        return {}
+
+    def extra_fields(self) -> dict:
+        """Columns added to every record from this page (e.g. the week it belongs to)."""
+        return {}
+
     def advance(self, raw_records: list, body: Any) -> bool:
         """Move to the next page. Return False when there are no more pages."""
         return False
 
-    def skip(self) -> None:
-        """Skip a page that failed."""
-        self.advance([None] * self.cfg.page_size, None)
+    def skip(self) -> bool:
+        """Skip a page that failed. Return False if there is no next page."""
+        return self.advance([None] * self.cfg.page_size, None)
 
 
 class NoPagination(Paginator):
@@ -403,7 +660,11 @@ class PagePaginator(Paginator):  # ?page=1&per_page=100
 
     def advance(self, raw_records, body):
         self.page += 1
-        return True  # stops at the first empty page
+        if self.cfg.pages_path and body is not None:
+            total_pages = get_path(body, self.cfg.pages_path)
+            if isinstance(total_pages, (int, float)):
+                return self.page - self.cfg.page_start < total_pages
+        return True  # otherwise stop at the first empty page
 
 
 class OffsetPaginator(Paginator):  # ?offset=0&limit=100
@@ -468,10 +729,40 @@ class ArcGISPaginator(Paginator):  # resultOffset / resultRecordCount + exceeded
         self.offset += len(raw_records)
         return bool(isinstance(body, dict) and body.get("exceededTransferLimit"))
 
+    def skip(self):
+        self.offset += self.cfg.page_size  # unknown whether more pages exist; try the next one
+        return True
+
+
+class WeekPaginator(Paginator):  # one request per ISO week: .../{year}/{week}
+    stop_on_empty = False  # a week with no reports is normal; keep going
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        if not cfg.week_from or not cfg.week_to:
+            raise SystemExit("week pagination needs a start and end week")
+        if cfg.week_from > cfg.week_to:
+            raise SystemExit(f"start week {cfg.week_from} is after end week {cfg.week_to}")
+        self.year, self.week = cfg.week_from
+
+    def path_vars(self):
+        return {"year": self.year, "week": self.week}
+
+    def extra_fields(self):
+        return {"year": self.year, "week": self.week}
+
+    def advance(self, raw_records, body):
+        self.year, self.week = next_iso_week(self.year, self.week)
+        return (self.year, self.week) <= self.cfg.week_to
+
+    def skip(self):
+        return self.advance([], None)
+
 
 PAGINATORS: dict[str, type[Paginator]] = {
     "none": NoPagination, "page": PagePaginator, "offset": OffsetPaginator,
     "range": RangePaginator, "cursor": CursorPaginator, "arcgis": ArcGISPaginator,
+    "week": WeekPaginator,
 }
 
 
@@ -488,8 +779,12 @@ class ScrapeResult:
     interrupted: bool = False
 
 
-def extract_records(body: Any, records_path: str | None) -> list | None:
-    data = body if records_path is None else get_path(body, records_path)
+def extract_records(body: Any, cfg: SourceConfig) -> list | None:
+    if cfg.parser == "jsonstat":
+        return jsonstat_to_records(body)
+    data = body if cfg.records_path is None else get_path(body, cfg.records_path)
+    if data is None and cfg.missing_records_is_empty:
+        return []
     return data if isinstance(data, list) else None
 
 
@@ -523,11 +818,14 @@ def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
             if page_no > 1:
                 polite_sleep(delay)
             params = {**cfg.params, **pager.params()}
-            log.info("Fetching page %d...", page_no)
+            extra = pager.extra_fields()
+            url = cfg.url.format(**pager.path_vars()) if pager.path_vars() else cfg.url
+            label = f"page {page_no}" + (f" ({', '.join(f'{k} {v}' for k, v in extra.items())})" if extra else "")
+            log.info("Fetching %s...", label)
 
             try:
-                body = fetch_json(session, cfg.url, params)
-                raw_records = extract_records(body, cfg.records_path)
+                body = fetch_json(session, url, params, method=cfg.method, json_body=cfg.json_body)
+                raw_records = extract_records(body, cfg)
                 if raw_records is None:
                     keys = list(body)[:10] if isinstance(body, dict) else type(body).__name__
                     raise FetchError(f"no list of records at path {cfg.records_path!r} "
@@ -535,14 +833,15 @@ def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
             except FetchError as exc:
                 result.pages_failed += 1
                 consecutive_failures += 1
-                log.error("Page %d failed: %s", page_no, exc)
+                log.error("%s failed: %s", label.capitalize(), exc)
                 if not pager.can_skip_failed_page:
                     log.error("This pagination type cannot skip a failed page; stopping.")
                     break
                 if consecutive_failures >= max_consecutive_failures:
                     log.error("%d pages in a row failed; stopping.", consecutive_failures)
                     break
-                pager.skip()
+                if not pager.skip():
+                    break
                 continue
 
             consecutive_failures = 0
@@ -552,8 +851,15 @@ def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
                     log.info("Server reports %s matching records in total.", total_hint)
 
             if not raw_records:
-                log.info("Page %d returned no records — reached the end.", page_no)
-                break
+                if pager.stop_on_empty:
+                    log.info("%s returned no records — reached the end.", label.capitalize())
+                    break
+                log.info("%s returned no records.", label.capitalize())
+                result.pages_ok += 1
+                if not pager.advance(raw_records, body):
+                    log.info("No more pages.")
+                    break
+                continue
 
             parsed = skipped = new = 0
             for i, raw in enumerate(raw_records):
@@ -561,8 +867,7 @@ def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
                     row, key = parse_record(raw, cfg)
                 except Exception as exc:  # one bad record must never stop the run
                     skipped += 1
-                    log.warning("Skipping record %d on page %d: %s: %s",
-                                i, page_no, type(exc).__name__, exc)
+                    log.warning("Skipping record %d on %s: %s: %s", i, label, type(exc).__name__, exc)
                     continue
                 parsed += 1
                 if key is not None:
@@ -570,19 +875,19 @@ def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
                         result.duplicates += 1
                         continue
                     seen_keys.add(key)
-                result.records.append(row)
+                result.records.append({**extra, **row} if extra else row)
                 new += 1
 
             result.pages_ok += 1
             result.records_skipped += skipped
             progress = f" of {total_hint}" if total_hint is not None else ""
-            log.info("Successfully parsed %d records on page %d (%d skipped, %d new). "
-                     "Running total: %d%s", parsed, page_no, skipped, new,
+            log.info("Successfully parsed %d records on %s (%d skipped, %d new). "
+                     "Running total: %d%s", parsed, label, skipped, new,
                      len(result.records), progress)
 
             if new == 0 and parsed > 0:
-                log.warning("Page %d added no new records; the API is probably ignoring the "
-                            "pagination parameters. Stopping to avoid a loop.", page_no)
+                log.warning("%s added no new records; the API is probably ignoring the "
+                            "pagination parameters. Stopping to avoid a loop.", label.capitalize())
                 break
             if not pager.advance(raw_records, body):
                 log.info("No more pages.")
@@ -626,6 +931,14 @@ def build_dataframe(records: list[dict]) -> pd.DataFrame:
     return df
 
 
+def add_provenance(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
+    """Record where and when every row came from, so merged tables stay traceable."""
+    df = df.copy()
+    df["source"] = source_name
+    df["retrieved_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return df
+
+
 def _atomic_write(path: Path, write: Callable[[Path], None]) -> None:
     """Write to a temporary file, then rename, so a crash never leaves a half-written file."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -653,43 +966,64 @@ def save_outputs(df: pd.DataFrame, out_dir: Path, basename: str) -> tuple[Path, 
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
+SOURCES = ["fiskeridir", "barentswatch", "brreg", "ssb_salmon", "worldbank", "comtrade",
+           "obis", "arcgis", "custom"]
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Scrape aquaculture data from a JSON API to CSV + JSON.",
                                 formatter_class=argparse.RawDescriptionHelpFormatter,
                                 epilog=__doc__.split("Examples:", 1)[1] if __doc__ else None)
-    p.add_argument("--source", choices=["fiskeridir", "obis", "arcgis", "custom"],
-                   default="fiskeridir", help="built-in source preset (default: fiskeridir)")
+    p.add_argument("--source", choices=SOURCES, default="fiskeridir",
+                   help="source preset (default: fiskeridir)")
     p.add_argument("--url", help="endpoint URL (required for arcgis/custom; overrides a preset)")
-    p.add_argument("--species", help="OBIS: scientific name, e.g. 'Salmo salar'")
-    p.add_argument("--param", action="append", metavar="KEY=VALUE",
+
+    g = p.add_argument_group("source options")
+    g.add_argument("--countries", help="worldbank: ISO3 codes separated by ';' (default NOR;ARE)")
+    g.add_argument("--indicator", help="worldbank: indicator id (default ER.FSH.AQUA.MT)")
+    g.add_argument("--years", help="worldbank: 2000:2024 | comtrade: 2022,2023")
+    g.add_argument("--reporters", help="comtrade: UN M49 codes, e.g. 578,784 (Norway, UAE)")
+    g.add_argument("--hs-codes", help="comtrade: HS codes (default 03 and 0301-0307)")
+    g.add_argument("--nace", help=f"brreg: industry codes (default {NORWAY_AQUACULTURE_NACE})")
+    g.add_argument("--weeks-from", help="barentswatch: first ISO week, e.g. 2025-W01")
+    g.add_argument("--weeks-to", help="barentswatch: last ISO week (default: last full week)")
+    g.add_argument("--last-weeks", type=int, default=52, help="ssb_salmon: number of recent weeks")
+    g.add_argument("--species", help="obis: scientific name, e.g. 'Salmo salar'")
+
+    a = p.add_argument_group("advanced")
+    a.add_argument("--param", action="append", metavar="KEY=VALUE",
                    help="extra query parameter (repeat for more)")
-    p.add_argument("--pagination", choices=sorted(PAGINATORS), help="override pagination type")
-    p.add_argument("--records-path", help="dot path to the record list ('' = body is the list)")
-    p.add_argument("--id-field", help="field path used for de-dup / cursor pagination")
-    p.add_argument("--page-size", type=int, help="records per request")
-    p.add_argument("--page-param"); p.add_argument("--size-param")
-    p.add_argument("--offset-param"); p.add_argument("--cursor-param")
-    p.add_argument("--field-map", help="JSON file: {output_column: path or [paths]}")
-    p.add_argument("--raw", action="store_true",
+    a.add_argument("--pagination", choices=sorted(PAGINATORS), help="override pagination type")
+    a.add_argument("--records-path", help="dot path to the record list ('' = body is the list)")
+    a.add_argument("--id-field", help="field path used for de-dup / cursor pagination")
+    a.add_argument("--page-size", type=int, help="records per request")
+    a.add_argument("--page-param"); a.add_argument("--size-param")
+    a.add_argument("--offset-param"); a.add_argument("--cursor-param")
+    a.add_argument("--field-map", help="JSON file: {output_column: path or [paths]}")
+    a.add_argument("--raw", action="store_true",
                    help="keep every field (flattened) instead of applying the field map")
-    p.add_argument("--max-pages", type=int, default=500, help="safety cap (default 500)")
-    p.add_argument("--delay", type=float, default=1.5,
+
+    r = p.add_argument_group("run")
+    r.add_argument("--max-pages", type=int, default=1000, help="safety cap (default 1000)")
+    r.add_argument("--delay", type=float, default=1.5,
                    help=f"seconds between requests, minimum {MIN_DELAY_SECONDS} (default 1.5)")
-    p.add_argument("--contact", default=os.environ.get("AQUA_SCRAPER_CONTACT"),
+    r.add_argument("--contact", default=os.environ.get("AQUA_SCRAPER_CONTACT"),
                    help="email/URL put in the User-Agent (or set AQUA_SCRAPER_CONTACT)")
-    p.add_argument("--bearer-token-env", metavar="ENV_VAR",
+    r.add_argument("--bearer-token-env", metavar="ENV_VAR",
                    help="name of an env var holding an API token (sent as Authorization: Bearer)")
-    p.add_argument("--ignore-robots", action="store_true", help="skip the robots.txt check")
-    p.add_argument("--out-dir", default=".", help="output folder (default: current folder)")
-    p.add_argument("--basename", default="aquaculture_data", help="output file name without extension")
-    p.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    r.add_argument("--ignore-robots", action="store_true", help="skip the robots.txt check")
+    r.add_argument("--out-dir", default=".", help="output folder (default: current folder)")
+    r.add_argument("--basename", default=DEFAULT_BASENAME,
+                   help=f"output file name without extension (default {DEFAULT_BASENAME})")
+    r.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
-                        format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                            format="%(asctime)s %(levelname)-7s %(message)s", datefmt="%H:%M:%S")
 
     cfg = build_source(args)
     if args.page_size is not None and args.page_size < 1:
@@ -712,7 +1046,19 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"Environment variable {args.bearer_token_env} is not set")
 
     session = create_session(user_agent, token)
-    if not args.ignore_robots and not robots_allows(session, cfg.url, user_agent):
+    if cfg.api_key_env and cfg.api_key_header and os.environ.get(cfg.api_key_env):
+        session.headers[cfg.api_key_header] = os.environ[cfg.api_key_env]
+    if cfg.oauth:
+        try:
+            session.headers["Authorization"] = f"Bearer {get_oauth_token(session, cfg.oauth)}"
+            log.info("Logged in to %s.", urlparse(cfg.oauth.token_url).netloc)
+        except FetchError as exc:
+            log.error("Could not log in for %s: %s", cfg.name, exc)
+            return 2
+
+    # robots.txt governs crawlers; a registered API client is governed by the API's own terms
+    check_robots = not args.ignore_robots and not cfg.oauth
+    if check_robots and not robots_allows(session, cfg.url.split("{", 1)[0], user_agent):
         log.error("robots.txt disallows %s for this bot. Stopping (use --ignore-robots only "
                   "if the data owner has given you permission).", cfg.url)
         return 2
@@ -724,7 +1070,7 @@ def main(argv: list[str] | None = None) -> int:
         log.error("No records were collected (%d pages failed). Nothing written.", result.pages_failed)
         return 2
 
-    df = build_dataframe(result.records)
+    df = add_provenance(build_dataframe(result.records), cfg.name)
     csv_path, json_path = save_outputs(df, Path(args.out_dir), args.basename)
     log.info("Saved %d records × %d columns to %s and %s", len(df), df.shape[1], csv_path, json_path)
     log.info("Summary: %d pages ok, %d pages failed, %d records skipped, %d duplicates removed, "
