@@ -194,7 +194,8 @@ def centre(geometry: Any) -> tuple[float | None, float | None]:
     return lat, lon
 
 
-def list_wfs_layers(session: requests.Session, url: str, pattern: str) -> list[tuple[str, str]]:
+def list_wfs_layers(session: requests.Session, url: str, pattern: str,
+                    exclude: str | None = None) -> list[tuple[str, str]]:
     resp = session.get(url, params={"service": "WFS", "version": "1.0.0", "request": "GetCapabilities"},
                        timeout=aq.DEFAULT_TIMEOUT, headers={"Accept": "application/xml,text/xml"})
     if resp.status_code >= 400:
@@ -209,14 +210,16 @@ def list_wfs_layers(session: requests.Session, url: str, pattern: str) -> list[t
             continue
         fields = {child.tag.rsplit("}", 1)[-1]: (child.text or "").strip() for child in el}
         name, title = fields.get("Name", ""), fields.get("Title", "")
-        if name and re.search(pattern, f"{name} {title}", re.IGNORECASE):
+        text = f"{name} {title}"
+        if name and re.search(pattern, text, re.IGNORECASE) and not (
+                exclude and re.search(exclude, text, re.IGNORECASE)):
             layers.append((name, title))
     return layers
 
 
 def fetch_wfs_layers(session: requests.Session, cfg: "aq.SourceConfig", delay: float):
     pattern = cfg.params.get("layer_pattern", r"aquacult")
-    layers = list_wfs_layers(session, cfg.url, pattern)
+    layers = list_wfs_layers(session, cfg.url, pattern, cfg.params.get("layer_exclude"))
     if not layers:
         raise aq.FetchError(f"no WFS layers match {pattern!r} at {cfg.url}")
     log.info("Found %d matching layers: %s", len(layers), ", ".join(n for n, _ in layers))

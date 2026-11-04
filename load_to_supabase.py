@@ -3,16 +3,18 @@
 load_to_supabase.py — upsert the tables built by run_all.py into a Supabase database.
 
     export SUPABASE_URL="https://<project-ref>.supabase.co"
-    export SUPABASE_SERVICE_ROLE_KEY="<service_role or sb_secret_... key>"
+    export SUPABASE_SECRET_KEY="<sb_secret_... key, or the legacy service_role key>"
     python load_to_supabase.py                    # loads data/*.json
     python load_to_supabase.py --only production_by_country
 
 The tables must already exist: they are created by the SQL files in
 supabase/migrations/ (apply them in filename order).
 
-Rows are upserted on each table's primary key, so loading the same scrape twice
-updates rows instead of duplicating them. Nothing is ever deleted, and the database
-records when each row was first seen (first_seen_at). Uses Supabase's REST API (PostgREST) over
+Rows are upserted on each table's primary key, so a row is never stored twice. Each
+row also carries a row_hash (a fingerprint of its data): before sending, the loader reads
+the hashes already in the database and sends only rows that are new or have changed, so
+unchanged data is not written again. Nothing is ever deleted, and the database records
+when each row was first seen (first_seen_at). Uses Supabase's REST API (PostgREST) over
 HTTPS, so no database driver is needed. The key bypasses Row Level Security: keep it
 in a GitHub secret or an environment variable, never in a file in the repo.
 """
@@ -30,6 +32,7 @@ from typing import Any
 import requests
 
 import aquaculture_scraper as aq
+from fingerprint import row_fingerprint
 
 log = logging.getLogger("load_to_supabase")
 
@@ -80,10 +83,6 @@ TABLES: dict[str, tuple[list[str], list[str]]] = {
         ["openalex_id", "doi", "title", "publication_year", "publication_date", "type", "language",
          "journal", "authors", "institutions", "countries", "topics", "cited_by_count",
          "is_open_access", "open_access_url", "landing_page_url", "source", "source_url", "record_url", "reference_url", "retrieved_at"]),
-    "research_datasets": (
-        ["zenodo_id"],
-        ["zenodo_id", "doi", "title", "publication_date", "resource_type", "creators", "keywords",
-         "license", "landing_page_url", "source", "source_url", "record_url", "reference_url", "retrieved_at"]),
     "news_articles": (
         ["url"],
         ["url", "title", "seen_date", "domain", "language", "source_country", "image_url", "source", "source_url", "record_url", "reference_url", "retrieved_at"]),
@@ -94,6 +93,10 @@ JSONB_COLUMNS: dict[str, set[str]] = {"facilities_europe": {"properties", "geome
 
 # Filled in by the database (never sent, so upserts never overwrite them)
 DATABASE_COLUMNS = {"first_seen_at"}
+
+# Sent with every row, but not part of the scraped data
+HASH_COLUMN = "row_hash"
+READ_PAGE = 1000  # rows per request when reading existing hashes
 
 
 class LoadError(Exception):
@@ -152,6 +155,57 @@ def auth_headers(api_key: str) -> dict[str, str]:
     return headers
 
 
+def _key(row: dict, key_cols: list[str]) -> tuple[str, ...]:
+    return tuple(str(row[c]) for c in key_cols)
+
+
+def existing_hashes(session: requests.Session, base_url: str, api_key: str,
+                    table: str) -> dict[tuple[str, ...], str | None] | None:
+    """Read (key -> row_hash) for every row already in the table.
+    Returns None if the table has no row_hash column yet (migration not applied)."""
+    key_cols, _ = TABLES[table]
+    url = f"{base_url}/rest/v1/{table}"
+    params = {"select": ",".join(key_cols + [HASH_COLUMN]),
+              "order": ",".join(f"{c}.asc" for c in key_cols), "limit": READ_PAGE}
+    hashes: dict[tuple[str, ...], str | None] = {}
+    offset = 0
+    while True:
+        try:
+            resp = session.get(url, params={**params, "offset": offset}, headers=auth_headers(api_key),
+                               timeout=aq.DEFAULT_TIMEOUT)
+        except requests.RequestException as exc:
+            raise LoadError(f"could not read existing rows: {exc}") from exc
+        if resp.status_code >= 300:
+            if HASH_COLUMN in resp.text and ("42703" in resp.text or "does not exist" in resp.text):
+                return None
+            hint = " (has the migration been applied to this project?)" if resp.status_code == 404 else ""
+            raise LoadError(f"reading existing rows failed with HTTP {resp.status_code}: "
+                            f"{resp.text[:300]!r}{hint}")
+        page = resp.json()
+        if not page:
+            return hashes
+        for row in page:
+            hashes[_key(row, key_cols)] = row.get(HASH_COLUMN)
+        offset += len(page)
+
+
+def only_new_or_changed(table: str, rows: list[dict],
+                        existing: dict[tuple[str, ...], str | None]) -> tuple[list[dict], int, int, int]:
+    """(rows to send, new, changed, unchanged)."""
+    key_cols, _ = TABLES[table]
+    send, new, changed = [], 0, 0
+    for row in rows:
+        old = existing.get(_key(row, key_cols), False)
+        if old is False:
+            new += 1
+        elif old == row[HASH_COLUMN]:
+            continue
+        else:
+            changed += 1
+        send.append(row)
+    return send, new, changed, len(rows) - len(send)
+
+
 def upsert(session: requests.Session, base_url: str, api_key: str, table: str,
            rows: list[dict], batch_size: int = BATCH_SIZE) -> int:
     key_cols, _ = TABLES[table]
@@ -193,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     base_url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
     api_key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SECRET_KEY") or "").strip()
     if not base_url or not api_key:
-        log.error("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY).")
+        log.error("Set SUPABASE_URL and SUPABASE_SECRET_KEY (or the legacy SUPABASE_SERVICE_ROLE_KEY).")
         return 2
     if not base_url.startswith(("https://", "http://127.0.0.1", "http://localhost")):
         log.error("SUPABASE_URL should look like https://<project-ref>.supabase.co")
@@ -216,8 +270,22 @@ def main(argv: list[str] | None = None) -> int:
                 # rows that all lack a key mean the field names need fixing: report it loudly
                 results[table] = "failed (no rows had a key)" if records else "skipped (empty file)"
                 continue
-            sent = upsert(session, base_url, api_key, table, rows, args.batch_size)
-            results[table] = f"ok ({sent} rows)"
+            for row in rows:
+                row[HASH_COLUMN] = row_fingerprint(row)
+            existing = existing_hashes(session, base_url, api_key, table)
+            if existing is None:
+                log.warning("%s: no row_hash column yet, so every row is sent. Run the latest "
+                            "migration in supabase/migrations/ to skip unchanged rows.", table)
+                for row in rows:
+                    del row[HASH_COLUMN]
+                to_send, summary = rows, f"{len(rows)} rows sent (unchanged rows not detectable)"
+            else:
+                to_send, new, changed, same = only_new_or_changed(table, rows, existing)
+                summary = f"{new} new, {changed} changed, {same} unchanged (not written)"
+            log.info("%s: %s", table, summary)
+            if to_send:
+                upsert(session, base_url, api_key, table, to_send, args.batch_size)
+            results[table] = f"ok ({summary})"
         except (LoadError, ValueError) as exc:
             log.error("%s: load failed: %s", table, exc)
             results[table] = "failed"

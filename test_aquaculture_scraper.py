@@ -89,6 +89,7 @@ WFS_CAPABILITIES = b"""<?xml version="1.0"?>
   <FeatureType><Name>emodnet:finfish</Name><Title>Finfish aquaculture</Title></FeatureType>
   <FeatureType><Name>emodnet:shellfish</Name><Title>Shellfish production</Title></FeatureType>
   <FeatureType><Name>emodnet:windfarms</Name><Title>Wind farms</Title></FeatureType>
+  <FeatureType><Name>emodnet:aquaculture</Name><Title>Advisory Councils (Aquaculture)</Title></FeatureType>
 </FeatureTypeList></WFS_Capabilities>"""
 
 WFS_FEATURES = {
@@ -185,7 +186,7 @@ class MockAPI(BaseHTTPRequestHandler):
                      "indicator": {"id": "ER.FSH.AQUA.MT", "value": "Aquaculture production (metric tons)"},
                      "value": v, "unit": ""}
                     for c, n, v in [("NOR", "Norway", 1650000), ("ARE", "United Arab Emirates", 3500),
-                                    ("NOR", "Norway", 1600000)]][(page - 1) * 2: page * 2]
+                                    ("NOR", "Norway", None)]][(page - 1) * 2: page * 2]  # None: not reported yet
             return self._send(200, [{"page": page, "pages": 2, "per_page": 2, "total": 3}, rows])
 
         if u.path == "/wb-error":
@@ -215,32 +216,25 @@ class MockAPI(BaseHTTPRequestHandler):
         if u.path == "/fao/Aquaculture_2026.1.0.zip":
             return self._send_raw(200, fao_zip_bytes(), "application/zip")
 
-        if u.path == "/eurostat":  # one country per request; LU has no data
-            geo = q["geo"]
+        if u.path == "/eurostat":  # one country and year block per request; LU has no data
+            geo, since, until = q["geo"], int(q["sinceTimePeriod"]), int(q["untilTimePeriod"])
             if geo == "LU":
                 return self._send(400, {"error": {"status": "400", "label": "No data"}})
-            if geo == "ES":
-                return self._send(200, {**eurostat_cube("ES"), "value": {}})
+            if geo == "ES" or not (since <= 2022 <= until or since <= 2023 <= until):
+                return self._send(200, {**eurostat_cube(geo), "value": {}})
             return self._send(200, eurostat_cube(geo))
 
-        if u.path == "/openalex":
-            cursor = q.get("cursor")
-            if cursor == "*":
-                return self._send(200, {"meta": {"count": 3, "next_cursor": "c2"}, "results": [
-                    openalex_work(1), openalex_work(2)]})
-            if cursor == "c2":
-                return self._send(200, {"meta": {"count": 3, "next_cursor": None}, "results": [openalex_work(3)]})
-            return self._send(400, {"error": "bad cursor"})
+        if u.path == "/openalex":  # page numbers (cursor paging would need an API key)
+            if "cursor" in q:
+                return self._send(401, {"error": "API key required for cursor paging"})
+            page, size = int(q["page"]), int(q["per-page"])
+            works = [openalex_work(i) for i in range(1, 4)][(page - 1) * size: page * size]
+            return self._send(200, {"meta": {"count": 3}, "results": works})
 
-        if u.path == "/zenodo":
-            page = int(q["page"])
-            hits = [{"id": i, "doi": f"10.5281/zenodo.{i}",
-                     "metadata": {"title": f"Dataset {i}", "publication_date": "2025-06-01",
-                                  "creators": [{"name": "Hansen, K."}], "keywords": ["aquaculture", "salmon"],
-                                  "resource_type": {"title": "Dataset"}, "license": {"id": "cc-by-4.0"}},
-                     "links": {"self_html": f"https://zenodo.org/records/{i}"}}
-                    for i in range(1, 4)][(page - 1) * 2: page * 2]
-            return self._send(200, {"hits": {"total": 3, "hits": hits}})
+        if u.path == "/gdelt-limited":  # "one request every 5 seconds": refuses the first try
+            if MockAPI.hits[u.path] == 1:
+                return self._send_raw(429, b"Please limit requests to one every 5 seconds", "text/plain")
+            return self._send(200, {"articles": [{"url": "https://news.example/c", "title": "Fish farm"}]})
 
         if u.path == "/gdelt":
             if q.get("mode") != "artlist" or q.get("format") != "json":
@@ -399,6 +393,9 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(MockAPI.hits["/wb/NOR;ARE/indicator/X"], 2)  # no 3rd request
         self.assertEqual({r["country_iso3"] for r in res.records}, {"NOR", "ARE"})
         self.assertEqual(res.records[1]["value"], 3500)
+        self.assertEqual((len(res.records), res.empty_rows), (2, 1))   # placeholder row not kept
+        income_group = {"countryiso3code": "", "country": {"id": "XD", "value": "High income"}}
+        self.assertEqual(aq.apply_field_map(income_group, aq.WORLDBANK_FIELDS)["country_iso3"], "XD")
 
     def test_worldbank_error_message(self):
         cfg = self.preset("--source", "worldbank", "--url", self.base + "/wb-error")
@@ -484,20 +481,27 @@ class ScraperTests(unittest.TestCase):
         res = self.run_scrape(cfg)
         self.assertEqual((res.records, res.pages_failed), ([], 1))
 
-    def test_eurostat_one_request_per_country(self):
+    def test_eurostat_periods(self):
+        self.assertEqual(aq.eurostat_periods(aq.date(2026, 11, 4)),
+                         [(2008, 2011), (2012, 2015), (2016, 2019), (2020, 2023), (2024, 2026)])
+
+    def test_eurostat_one_request_per_country_and_year_block(self):
         cfg = self.preset("--source", "eurostat", "--url", self.base + "/eurostat", "--geo", "NO,LU,ES,IS")
-        res = self.run_scrape(cfg)
-        self.assertEqual(MockAPI.hits["/eurostat"], 4)
-        self.assertEqual(res.pages_failed, 1)              # LU failed; the run carried on
+        blocks = len(aq.eurostat_periods())
+        res = self.run_scrape(cfg, max_pages=100)
+        self.assertEqual(MockAPI.hits["/eurostat"], 4 * blocks)
+        self.assertEqual(res.pages_failed, blocks)          # LU failed in every block; the run carried on
         self.assertEqual(len(res.records), 6)              # 3 filled cells each for NO and IS
         first = res.records[0]
         self.assertEqual((first["geo"], first["species"], first["year"], first["value"]),
                          ("NO", "Atlantic salmon", "2022", 100.0))
         self.assertEqual(first["cell_key"], "species=SAL|unit=TLW|geo=NO|time=2022")
         self.assertIn("geo=IS", res.records[-1]["source_url"])
+        self.assertIn("sinceTimePeriod=2020", res.records[-1]["source_url"])
 
-    def test_openalex_cursor_from_response(self):
-        cfg = self.preset("--source", "openalex", "--url", self.base + "/openalex", "--contact", "me@example.org")
+    def test_openalex_page_numbers(self):
+        cfg = self.preset("--source", "openalex", "--url", self.base + "/openalex", "--contact", "me@example.org",
+                          "--page-size", "2")
         self.assertEqual(cfg.params["mailto"], "me@example.org")
         res = self.run_scrape(cfg)
         self.assertEqual(res.pages_failed, 0)
@@ -506,14 +510,19 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(r["authors"], "A. Berg; S. Ali")
         self.assertEqual(r["countries"], "NO; AE")
         self.assertEqual(r["record_url"], "https://doi.org/10.1/1")
-        self.assertIn("cursor=c2", res.records[2]["source_url"])
+        self.assertIn("page=2", res.records[2]["source_url"])
+        self.assertNotIn("cursor", res.records[2]["source_url"])
 
-    def test_zenodo(self):
-        cfg = self.preset("--source", "zenodo", "--url", self.base + "/zenodo", "--page-size", "2")
-        res = self.run_scrape(cfg)
-        self.assertEqual(len(res.records), 3)
-        self.assertEqual(res.records[0]["keywords"], "aquaculture; salmon")
-        self.assertEqual(res.records[0]["record_url"], "https://zenodo.org/records/1")
+    def test_gdelt_waits_out_rate_limit(self):
+        cfg = self.preset("--source", "gdelt", "--url", self.base + "/gdelt-limited")
+        self.assertFalse(cfg.retry_on_429)      # no instant retries for a 1-request-per-5-s API
+        session = aq.create_session("TestBot/1.0", retry_on_429=False)
+        with mock.patch.object(aq.time, "sleep") as slept:
+            res = self.run_scrape(cfg, session=session)
+        self.assertEqual(res.pages_failed, 0)
+        self.assertEqual(len(res.records), 1)
+        self.assertEqual(MockAPI.hits["/gdelt-limited"], 2)
+        slept.assert_called_once_with(10.0)
 
     def test_gdelt(self):
         cfg = self.preset("--source", "gdelt", "--url", self.base + "/gdelt", "--timespan", "8d")
@@ -526,7 +535,8 @@ class ScraperTests(unittest.TestCase):
         cfg = self.preset("--source", "emodnet", "--url", self.base + "/wfs", "--page-size", "2")
         res = self.run_scrape(cfg)
         self.assertEqual(res.pages_failed, 0)
-        self.assertEqual({r["layer"] for r in res.records}, {"emodnet:finfish", "emodnet:shellfish"})  # no wind farms
+        # no wind farms, and no advisory-council areas (not farm sites)
+        self.assertEqual({r["layer"] for r in res.records}, {"emodnet:finfish", "emodnet:shellfish"})
         self.assertEqual(len(res.records), 4)               # 3 finfish over 2 pages + 1 shellfish
         site = res.records[0]
         self.assertEqual((site["name"], site["country"], site["latitude"], site["longitude"]),
@@ -537,9 +547,12 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(json.loads(shell["geometry"])["type"], "Polygon")   # full shape kept
 
     def test_worldbank_many_indicators_need_source(self):
-        cfg = self.preset("--source", "worldbank", "--indicator", aq.WORLDBANK_FISHERY_INDICATORS, "--countries", "all")
+        cfg = self.preset("--source", "worldbank", "--indicator", "ER.FSH.AQUA.MT;ER.FSH.CAPT.MT", "--countries", "all")
         self.assertEqual(cfg.params["source"], "2")
-        self.assertIn("/country/all/indicator/ER.FSH.AQUA.MT;ER.FSH.CAPT.MT;ER.FSH.PROD.MT", cfg.url)
+        self.assertIn("/country/all/indicator/ER.FSH.AQUA.MT;ER.FSH.CAPT.MT", cfg.url)
+        # the scheduled job skips the FAO-derived aquaculture and total indicators (already in the FAO table)
+        self.assertEqual(aq.WORLDBANK_FISHERY_INDICATORS, "ER.FSH.CAPT.MT")
+        self.assertNotIn("source", self.preset("--source", "worldbank", "--indicator", "ER.FSH.CAPT.MT").params)
 
     def test_end_to_end_cli_writes_csv_and_json(self):
         with tempfile.TemporaryDirectory() as out:

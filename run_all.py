@@ -31,7 +31,7 @@ JOBS: dict[str, tuple[list[str], str]] = {
     "production_by_country": (["--source", "worldbank", "--countries", "all",
                                "--indicator", aq.WORLDBANK_FISHERY_INDICATORS,
                                "--years", f"1990:{date.today().year}"],
-                              "All countries: aquaculture, capture and total fisheries, tonnes per year"),
+                              "All countries: capture fisheries, tonnes per year (aquaculture is in the FAO table)"),
     "trade_fish_by_country": (["--source", "comtrade", "--reporters", "578,784"],
                               "Norway + UAE: fish and seafood imports/exports (HS 03)"),
     "fao_aquaculture_production": (["--source", "fao_aquaculture"],
@@ -40,12 +40,10 @@ JOBS: dict[str, tuple[list[str], str]] = {
                                         "EU-27 + Norway + Iceland: production by species (Eurostat)"),
     "facilities_europe": (["--source", "emodnet"],
                           "Europe: aquaculture sites and areas with geometry (EMODnet)"),
-    "research_publications": (["--source", "openalex", "--since-days", "35"],
-                              "Scientific papers on aquaculture from the last 35 days (OpenAlex)"),
-    "research_datasets": (["--source", "zenodo", "--max-pages", "40"],
-                          "The 1,000 newest aquaculture datasets on Zenodo"),
-    "news_articles": (["--source", "gdelt", "--timespan", "8d"],
-                      "Aquaculture news from the last 8 days (GDELT)"),
+    "research_publications": (["--source", "openalex", "--since-days", "35", "--max-pages", "50"],
+                              "Scientific papers and datasets on aquaculture from the last 35 days (OpenAlex)"),
+    "news_articles": (["--source", "gdelt", "--timespan", "2d"],
+                      "Aquaculture news from the last 2 days (GDELT; runs daily)"),
 }
 
 
