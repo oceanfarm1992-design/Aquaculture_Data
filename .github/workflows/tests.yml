@@ -39,5 +39,5 @@ jobs:
           python aquaculture_scraper.py --help > /dev/null
           python run_all.py --list
 
-      - name: Run offline tests (mock API, no internet needed)
-        run: python -m unittest -v test_aquaculture_scraper.py
+      - name: Run offline tests (mock APIs, no internet needed)
+        run: python -m unittest discover -v -p "test_*.py"

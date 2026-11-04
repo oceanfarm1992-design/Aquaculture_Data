@@ -5,6 +5,18 @@
 - `source`: which source the row came from
 - `retrieved_at`: when it was downloaded (UTC)
 
+## Database keys
+
+In Supabase (`supabase/migrations/`), each table has a primary key that the loader upserts on:
+
+| Table | Primary key |
+|---|---|
+| `facilities_norway` | `site_number` |
+| `companies_norway` | `org_number` |
+| `prices_norway_salmon_export` | `period`, `product_code`, `measure_code` |
+| `production_by_country` | `country_iso3`, `year`, `indicator_id` |
+| `trade_fish_by_country` | `year`, `reporter_code`, `flow_code`, `partner_code`, `hs_code` |
+
 ## How the tables link
 
 ```
