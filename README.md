@@ -72,7 +72,8 @@ Path syntax: `a.b` (nested key), `a[0].b` (list item), `a[*].b` (every item, joi
 
 - **Robust:** retries on 429/500/502/503/504 with exponential backoff and `Retry-After` support; (10s, 30s) timeouts; invalid JSON and API errors reported inside a 200 response are logged, not raised.
 - **Polite:** at least 1s between requests (default 1.5s, with jitter), a descriptive User-Agent with your contact, and a robots.txt check.
-- **Clean output:** nested JSON is flattened with `pandas.json_normalize`; strings are trimmed; out-of-range coordinates are blanked; duplicates are removed; every row records its `source` and `retrieved_at`.
+- **Clean output:** nested JSON is flattened with `pandas.json_normalize`; strings are trimmed; out-of-range coordinates are blanked; duplicates are removed.
+- **Referenced:** every row ends with `source`, `source_url` (the exact API request it came from), `record_url` (a link to the record, where available), `reference_url` (the dataset page to cite) and `retrieved_at`. See [SCHEMA.md](SCHEMA.md).
 - **Fault-tolerant:** bad records are skipped and logged; failed pages are skipped (it stops after 3 in a row); a loop guard stops if the API ignores pagination; Ctrl+C saves partial results; files are written atomically.
 - **Supports:** page, offset, range, cursor, ArcGIS, week-by-week and one-request-per-value pagination; GET and POST; JSON-stat 2.0 (statistics offices).
 
@@ -97,10 +98,10 @@ A run is marked failed if any table fails or is only partly collected; the files
 
 The weekly **Scrape data** workflow can also save every table into your Supabase database. Rows are upserted on each table's primary key, so re-running a scrape updates rows instead of duplicating them.
 
-**1. Create the tables.** The SQL is in [`supabase/migrations/`](supabase/migrations/). Either:
+**1. Create the tables.** The SQL is in [`supabase/migrations/`](supabase/migrations/); there is one file per change, applied in filename order. Either:
 
 - Link this repo in Supabase: Project → **Settings → Integrations → GitHub**, choose this repo, set the Supabase directory to `supabase`, and turn on **Deploy to production** for `main`. The Supabase GitHub app then applies the migration when it is merged into `main`.
-- Or open the Supabase **SQL Editor**, paste the migration file and run it.
+- Or open the Supabase **SQL Editor**, then paste and run each migration file, oldest first. Each file is safe to run again.
 
 **2. Give GitHub Actions access.** In GitHub: Settings → Secrets and variables → Actions.
 

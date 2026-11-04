@@ -82,6 +82,9 @@ DEFAULT_BASENAME = "aquaculture_data"
 # Output column -> candidate field paths. The first path that resolves to a value is used.
 FieldMap = dict[str, list[str]]
 
+# Columns added to every row so each value can be traced back and cited
+PROVENANCE_COLUMNS = ["source", "source_url", "record_url", "reference_url", "retrieved_at"]
+
 COUNTRY_CODES = {  # ISO3 -> UN M49 code (used by UN Comtrade)
     "NOR": "578", "ARE": "784",
 }
@@ -112,6 +115,8 @@ class SourceConfig:
     iterate_param: str | None = None  # "values" pagination: one request per value ...
     iterate_values: list[str] = field(default_factory=list)  # ... of this parameter
     table: str = DEFAULT_BASENAME  # table name used by run_all.py / SCHEMA.md
+    reference_url: str | None = None  # page to cite for the dataset (reference_url column)
+    record_url: Callable[[dict], str | None] | None = None  # link to one record (record_url column)
     # Query-parameter names used by the paginators
     page_param: str = "page"
     size_param: str = "per_page"
@@ -271,7 +276,8 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             name="Fiskeridirektoratet Aquaculture Register",
             url="https://api.fiskeridir.no/pub-aqua/api/v1/sites",
             pagination="range", page_size=100, field_map=FISKERIDIR_FIELDS,
-            id_field="siteId", table="facilities_norway")
+            id_field="siteId", table="facilities_norway",
+            reference_url="https://api.fiskeridir.no/pub-aqua/api/v1/sites")
     elif s == "brreg":
         cfg = SourceConfig(
             name="Brønnøysund Register Centre (Enhetsregisteret)",
@@ -280,7 +286,9 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             page_size=100, params={"naeringskode": args.nace or NORWAY_AQUACULTURE_NACE},
             records_path="_embedded.enheter", pages_path="page.totalPages",
             total_path="page.totalElements", missing_records_is_empty=True,
-            field_map=BRREG_FIELDS, id_field="organisasjonsnummer", table="companies_norway")
+            field_map=BRREG_FIELDS, id_field="organisasjonsnummer", table="companies_norway",
+            reference_url="https://data.brreg.no/enhetsregisteret/api/docs/index.html",
+            record_url=lambda r: get_path(r, "_links.self.href"))
     elif s == "ssb_salmon":
         cfg = SourceConfig(
             name="Statistics Norway table 03024 (salmon exports)",
@@ -294,7 +302,8 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
                 ],
                 "response": {"format": "json-stat2"},
             },
-            field_map=SSB_SALMON_FIELDS, table="prices_norway_salmon_export")
+            field_map=SSB_SALMON_FIELDS, table="prices_norway_salmon_export",
+            reference_url="https://www.ssb.no/en/statbank/table/03024")
     elif s == "worldbank":
         countries = args.countries or "NOR;ARE"
         indicator = args.indicator or "ER.FSH.AQUA.MT"
@@ -304,7 +313,8 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             pagination="page", page_size=1000, records_path="[1]", pages_path="[0].pages",
             total_path="[0].total", missing_records_is_empty=True,
             params={"format": "json", "date": args.years or "2000:2024"},
-            field_map=WORLDBANK_FIELDS, table="production_by_country")
+            field_map=WORLDBANK_FIELDS, table="production_by_country",
+            reference_url=f"https://data.worldbank.org/indicator/{indicator}")
     elif s == "comtrade":
         reporters = args.reporters or ",".join(COUNTRY_CODES.values())
         this_year = date.today().year
@@ -317,30 +327,33 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             params={"reporterCode": reporters,
                     "cmdCode": args.hs_codes or "03,0301,0302,0303,0304,0305,0306,0307",
                     "flowCode": "M,X", "partnerCode": "0", "includeDesc": "true"},
-            field_map=COMTRADE_FIELDS, table="trade_fish_by_country")
+            field_map=COMTRADE_FIELDS, table="trade_fish_by_country",
+            reference_url="https://comtradeplus.un.org/")
     elif s == "obis":
         cfg = SourceConfig(
             name="OBIS occurrences", url="https://api.obis.org/v3/occurrence",
             pagination="cursor", records_path="results", page_size=1000,
             params={"scientificname": args.species or "Salmo salar"}, field_map=OBIS_FIELDS,
             id_field="id", total_path="total", size_param="size", cursor_param="after",
-            table="species_occurrences")
+            table="species_occurrences", reference_url="https://obis.org/")
     elif s == "arcgis":
         if not args.url:
             raise SystemExit("--source arcgis needs --url (a FeatureServer/MapServer layer URL)")
         url = args.url.rstrip("/")
         if not url.endswith("/query"):
             url += "/query"
+        layer_url = url[: -len("/query")]
         cfg = SourceConfig(
             name="ArcGIS REST layer", url=url, pagination="arcgis", records_path="features",
             page_size=1000, params={"where": "1=1", "outFields": "*", "returnGeometry": "true",
                                     "outSR": "4326", "f": "json"},
-            transform=_arcgis_feature_to_record, id_field="OBJECTID", table="map_layer")
+            transform=_arcgis_feature_to_record, id_field="OBJECTID", table="map_layer",
+            reference_url=layer_url)
     else:  # custom
         if not args.url:
             raise SystemExit("--source custom needs --url")
         cfg = SourceConfig(name="Custom JSON API", url=args.url, pagination="page",
-                           records_path="data", id_field="id")
+                           records_path="data", id_field="id", reference_url=args.url)
 
     overrides: dict[str, Any] = {}
     if args.url and s not in ("arcgis",):
@@ -363,7 +376,14 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
         overrides["field_map"] = load_field_map(args.field_map)
     if args.raw:
         overrides["field_map"] = None
-    return replace(cfg, **overrides)
+    if args.reference_url:
+        overrides["reference_url"] = args.reference_url
+    cfg = replace(cfg, **overrides)
+    if s == "arcgis" and cfg.id_field:  # each ArcGIS feature has its own URL: <layer>/<object id>
+        layer, oid_field = cfg.url[: -len("/query")], cfg.id_field
+        cfg = replace(cfg, record_url=lambda r: (f"{layer}/{r[oid_field]}"
+                                                 if r.get(oid_field) is not None else None))
+    return cfg
 
 
 def _parse_kv(text: str) -> tuple[str, str]:
@@ -525,8 +545,9 @@ class FetchError(Exception):
 
 
 def fetch_json(session: requests.Session, url: str, params: dict, *, method: str = "GET",
-               json_body: dict | None = None, timeout=DEFAULT_TIMEOUT) -> Any:
-    """Send a request and decode JSON. Raises FetchError with a readable reason on any failure."""
+               json_body: dict | None = None, timeout=DEFAULT_TIMEOUT) -> tuple[Any, str]:
+    """Send a request and decode JSON. Returns (body, final URL including the query string).
+    Raises FetchError with a readable reason on any failure."""
     try:
         resp = session.request(method, url, params=params, json=json_body, timeout=timeout)
     except requests.exceptions.RetryError as exc:
@@ -551,7 +572,7 @@ def fetch_json(session: requests.Session, url: str, params: dict, *, method: str
     if (isinstance(body, list) and len(body) == 1 and isinstance(body[0], dict)
             and "message" in body[0]):  # World Bank
         raise FetchError(f"API error: {body[0]['message']}")
-    return body
+    return body, resp.url
 
 
 # --------------------------------------------------------------------------------------
@@ -750,13 +771,22 @@ def extract_records(body: Any, cfg: SourceConfig) -> list | None:
     return data if isinstance(data, list) else None
 
 
-def parse_record(raw: Any, cfg: SourceConfig) -> tuple[dict, Any]:
-    """Return (output row, dedup key). Raises on records that cannot be used."""
+def parse_record(raw: Any, cfg: SourceConfig, page_url: str | None = None) -> tuple[dict, Any]:
+    """Return (output row, dedup key). Raises on records that cannot be used.
+
+    Adds source_url (the API request this row came from) and, when the source has
+    per-record links, record_url."""
     record = cfg.transform(raw) if cfg.transform else raw
     if not isinstance(record, dict):
         raise TypeError(f"expected an object, got {type(record).__name__}: {str(record)[:80]!r}")
     key = get_path(record, cfg.id_field) if cfg.id_field else None
-    row = apply_field_map(record, cfg.field_map) if cfg.field_map else record
+    row = apply_field_map(record, cfg.field_map) if cfg.field_map else dict(record)
+    row["source_url"] = page_url
+    if cfg.record_url:
+        try:
+            row["record_url"] = cfg.record_url(record)
+        except Exception:  # a missing link must not lose the record
+            row["record_url"] = None
     return row, key
 
 
@@ -786,7 +816,8 @@ def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
             log.info("Fetching %s...", label)
 
             try:
-                body = fetch_json(session, url, params, method=cfg.method, json_body=cfg.json_body)
+                body, page_url = fetch_json(session, url, params, method=cfg.method,
+                                            json_body=cfg.json_body)
                 raw_records = extract_records(body, cfg)
                 if raw_records is None:
                     keys = list(body)[:10] if isinstance(body, dict) else type(body).__name__
@@ -826,7 +857,7 @@ def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
             parsed = skipped = new = 0
             for i, raw in enumerate(raw_records):
                 try:
-                    row, key = parse_record(raw, cfg)
+                    row, key = parse_record(raw, cfg, page_url)
                 except Exception as exc:  # one bad record must never stop the run
                     skipped += 1
                     log.warning("Skipping record %d on %s: %s: %s", i, label, type(exc).__name__, exc)
@@ -893,12 +924,19 @@ def build_dataframe(records: list[dict]) -> pd.DataFrame:
     return df
 
 
-def add_provenance(df: pd.DataFrame, source_name: str) -> pd.DataFrame:
-    """Record where and when every row came from, so merged tables stay traceable."""
+def add_provenance(df: pd.DataFrame, cfg: SourceConfig) -> pd.DataFrame:
+    """Record where and when every row came from, so merged tables stay traceable and citable.
+    The provenance columns are placed last, in a fixed order."""
     df = df.copy()
-    df["source"] = source_name
+    df["source"] = cfg.name
+    if "source_url" not in df.columns:
+        df["source_url"] = None
+    if "record_url" not in df.columns:
+        df["record_url"] = None
+    df["reference_url"] = cfg.reference_url
     df["retrieved_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    return df
+    data_cols = [c for c in df.columns if c not in PROVENANCE_COLUMNS]
+    return df[data_cols + PROVENANCE_COLUMNS]
 
 
 def _atomic_write(path: Path, write: Callable[[Path], None]) -> None:
@@ -962,6 +1000,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     a.add_argument("--page-param"); a.add_argument("--size-param")
     a.add_argument("--offset-param"); a.add_argument("--cursor-param")
     a.add_argument("--field-map", help="JSON file: {output_column: path or [paths]}")
+    a.add_argument("--reference-url", help="page to cite for this dataset (reference_url column)")
     a.add_argument("--raw", action="store_true",
                    help="keep every field (flattened) instead of applying the field map")
 
@@ -1012,7 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
         log.error("No records were collected (%d pages failed). Nothing written.", result.pages_failed)
         return 2
 
-    df = add_provenance(build_dataframe(result.records), cfg.name)
+    df = add_provenance(build_dataframe(result.records), cfg)
     csv_path, json_path = save_outputs(df, Path(args.out_dir), args.basename)
     log.info("Saved %d records × %d columns to %s and %s", len(df), df.shape[1], csv_path, json_path)
     log.info("Summary: %d pages ok, %d pages failed, %d records skipped, %d duplicates removed, "

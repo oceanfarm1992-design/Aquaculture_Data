@@ -127,6 +127,7 @@ class MockAPI(BaseHTTPRequestHandler):
             companies = [{"organisasjonsnummer": str(900000000 + i), "navn": f"Laks AS {i}",
                           "naeringskode1": {"kode": "03.211", "beskrivelse": "Sea farming"},
                           "antallAnsatte": 10 * i,
+                          "_links": {"self": {"href": f"https://data.brreg.no/enhetsregisteret/api/enheter/{900000000 + i}"}},
                           "forretningsadresse": {"adresse": ["Kaia 1", "Bygg B"], "poststed": "BERGEN"}}
                          for i in range(3)][page * size:(page + 1) * size]
             body = {"page": {"size": size, "totalElements": 3, "totalPages": 2, "number": page}}
@@ -243,7 +244,15 @@ class ScraperTests(unittest.TestCase):
                           "--page-size", "2")
         res = self.run_scrape(cfg)
         self.assertEqual(len(res.records), 5)
-        self.assertEqual(res.records[0], {"OBJECTID": 0, "SITE": "Site 0", "longitude": 10.0, "latitude": 63.0})
+        first = res.records[0]
+        self.assertEqual({k: first[k] for k in ("OBJECTID", "SITE", "longitude", "latitude")},
+                         {"OBJECTID": 0, "SITE": "Site 0", "longitude": 10.0, "latitude": 63.0})
+        layer = self.base + "/arcgis/FeatureServer/0"
+        self.assertEqual(first["record_url"], layer + "/0")           # one link per feature
+        self.assertTrue(first["source_url"].startswith(layer + "/query?"))
+        self.assertIn("resultOffset=0", first["source_url"])
+        self.assertIn("resultOffset=2", res.records[2]["source_url"])  # page 2's request
+        self.assertEqual(cfg.reference_url, layer)
 
     def test_arcgis_error_in_200_body(self):
         cfg = aq.SourceConfig(name="t", url=self.base + "/arcgis-error/query", pagination="arcgis",
@@ -284,6 +293,8 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(MockAPI.hits["/brreg"], 2)
         self.assertEqual(res.records[0]["address"], "Kaia 1; Bygg B")
         self.assertEqual(res.records[0]["org_number"], "900000000")
+        self.assertEqual(res.records[0]["record_url"], "https://data.brreg.no/enhetsregisteret/api/enheter/900000000")
+        self.assertIn("page=1", res.records[2]["source_url"])
 
     def test_week_pagination(self):
         cfg = self.preset("--source", "custom", "--url", self.base + "/weekly/{year}/{week}",
@@ -303,7 +314,9 @@ class ScraperTests(unittest.TestCase):
         res = self.run_scrape(cfg)
         self.assertEqual(len(res.records), 8)
         self.assertEqual(res.records[2], {"period": "2025U01", "product_code": "01", "product": "Fresh salmon",
-                                          "measure_code": "Kilopris", "measure": "Price (NOK/kg)", "value": 85.5})
+                                          "measure_code": "Kilopris", "measure": "Price (NOK/kg)", "value": 85.5,
+                                          "source_url": self.base + "/ssb"})
+        self.assertEqual(cfg.reference_url, "https://www.ssb.no/en/statbank/table/03024")
 
     def test_comtrade_keyless_one_request_per_year_end_to_end(self):
         with tempfile.TemporaryDirectory() as out:
@@ -315,8 +328,11 @@ class ScraperTests(unittest.TestCase):
         self.assertNotIn("Authorization", MockAPI.last_headers)
         self.assertEqual(list(df["reporter_iso3"]), ["ARE", "NOR"])
         self.assertEqual(df.loc[1, "trade_value_usd"], 8.0e9)
-        self.assertIn("UN Comtrade", df.loc[0, "source"])   # provenance columns
-        self.assertIn("retrieved_at", df.columns)
+        self.assertIn("UN Comtrade", df.loc[0, "source"])   # provenance columns, always last
+        self.assertEqual(list(df.columns[-5:]), aq.PROVENANCE_COLUMNS)
+        self.assertIn("period=2023", df.loc[0, "source_url"])
+        self.assertIn("reporterCode=578%2C784", df.loc[0, "source_url"])
+        self.assertEqual(df.loc[0, "reference_url"], "https://comtradeplus.un.org/")
 
     def test_comtrade_error_string(self):
         cfg = self.preset("--source", "comtrade", "--url", self.base + "/comtrade-error", "--years", "2023")
@@ -334,6 +350,8 @@ class ScraperTests(unittest.TestCase):
             self.assertEqual(len(data), 8)
             self.assertIn("location.lat", csv_df.columns)  # json_normalize flattening
             self.assertIn("operator.company_name", data[0])
+            self.assertEqual(data[0]["reference_url"], self.base + "/farms")  # custom: the API itself
+            self.assertIn("page=1", data[0]["source_url"])
 
     def test_run_all_needs_no_keys(self):
         """Every table builds with an environment that has no keys or tokens at all."""
