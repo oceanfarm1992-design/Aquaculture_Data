@@ -1,7 +1,7 @@
 name: Scrape data
 
 # Builds the tables with run_all.py, then keeps each piece of data once:
-#   - Supabase (if SUPABASE_URL and the SUPABASE_SERVICE_ROLE_KEY secret are set): only
+#   - Supabase (if the SUPABASE_URL and SUPABASE_SECRET_KEY secrets are set): only
 #     new or changed rows are written; nothing is deleted
 #   - GitHub Releases (weekly runs, and daily runs when Supabase is not set up): only
 #     tables whose content changed since the last archive are stored, as CSV; a
@@ -68,13 +68,14 @@ jobs:
         if: ${{ !cancelled() }}
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # the new sb_secret_... key, or the legacy service_role key
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           if [ -n "$SUPABASE_URL" ] && [ -n "$SUPABASE_SERVICE_ROLE_KEY" ]; then
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Supabase not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY); skipping the database load."
+            echo "::notice::Supabase not configured (needs secrets SUPABASE_URL and SUPABASE_SECRET_KEY); skipping the database load."
           fi
 
       - name: Load into Supabase
@@ -82,7 +83,8 @@ jobs:
         if: ${{ !cancelled() && steps.supabase.outputs.configured == 'true' }}
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # the new sb_secret_... key, or the legacy service_role key
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SECRET_KEY || secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: python load_to_supabase.py --data-dir data
 
       - name: Summarise output

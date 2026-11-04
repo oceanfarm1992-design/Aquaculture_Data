@@ -142,7 +142,7 @@ The weekly **Scrape data** workflow can also save every table into your Supabase
 | Name | Where | Value |
 |---|---|---|
 | `SUPABASE_URL` | Variables (or Secrets) | `https://<project-ref>.supabase.co` (Supabase → Project Settings → Data API) |
-| `SUPABASE_SERVICE_ROLE_KEY` | **Secrets** | The `service_role` key or a `sb_secret_...` secret key (Supabase → Project Settings → API Keys) |
+| `SUPABASE_SECRET_KEY` | **Secrets** | A `sb_secret_...` secret key (Supabase → Project Settings → API Keys). The legacy `service_role` key also works, under this name or `SUPABASE_SERVICE_ROLE_KEY` |
 
 This key can read and write the whole database, so keep it only in GitHub Secrets. Never commit it, and don't use the `anon` / publishable key, which can't write.
 
@@ -152,7 +152,7 @@ To load from your own computer instead:
 
 ```bash
 export SUPABASE_URL="https://<project-ref>.supabase.co"
-export SUPABASE_SERVICE_ROLE_KEY="<key>"
+export SUPABASE_SECRET_KEY="<sb_secret_... key>"
 python run_all.py --contact you@example.org
 python load_to_supabase.py
 ```

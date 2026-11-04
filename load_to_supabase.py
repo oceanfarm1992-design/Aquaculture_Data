@@ -3,7 +3,7 @@
 load_to_supabase.py — upsert the tables built by run_all.py into a Supabase database.
 
     export SUPABASE_URL="https://<project-ref>.supabase.co"
-    export SUPABASE_SERVICE_ROLE_KEY="<service_role or sb_secret_... key>"
+    export SUPABASE_SECRET_KEY="<sb_secret_... key, or the legacy service_role key>"
     python load_to_supabase.py                    # loads data/*.json
     python load_to_supabase.py --only production_by_country
 
@@ -247,7 +247,7 @@ def main(argv: list[str] | None = None) -> int:
     base_url = (os.environ.get("SUPABASE_URL") or "").strip().rstrip("/")
     api_key = (os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or os.environ.get("SUPABASE_SECRET_KEY") or "").strip()
     if not base_url or not api_key:
-        log.error("Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_SECRET_KEY).")
+        log.error("Set SUPABASE_URL and SUPABASE_SECRET_KEY (or the legacy SUPABASE_SERVICE_ROLE_KEY).")
         return 2
     if not base_url.startswith(("https://", "http://127.0.0.1", "http://localhost")):
         log.error("SUPABASE_URL should look like https://<project-ref>.supabase.co")
