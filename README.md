@@ -1,5 +1,7 @@
 # Aquaculture_Data
 
+[![Tests](https://github.com/oceanfarm1992-design/Aquaculture_Data/actions/workflows/tests.yml/badge.svg)](https://github.com/oceanfarm1992-design/Aquaculture_Data/actions/workflows/tests.yml)
+
 A polite, fault-tolerant Python scraper that collects aquaculture data from public APIs for **Norway** and the **UAE**, and saves it as clean, flat CSV (UTF-8) and JSON tables.
 
 **No API key, account or login is needed.** Every source is open data.
@@ -75,6 +77,21 @@ Path syntax: `a.b` (nested key), `a[0].b` (list item), `a[*].b` (every item, joi
 - **Supports:** page, offset, range, cursor, ArcGIS, week-by-week and one-request-per-value pagination; GET and POST; JSON-stat 2.0 (statistics offices).
 
 Exit codes: `0` success, `1` partial (some pages failed or interrupted), `2` no data or blocked by robots.txt.
+
+## Automated runs (GitHub Actions)
+
+- **Tests** (`.github/workflows/tests.yml`): runs the offline tests on Python 3.10, 3.12 and 3.13 on every push to `main` and every pull request.
+- **Scrape data** (`.github/workflows/scrape.yml`): runs `run_all.py` every Monday at 03:17 UTC, and whenever you start it by hand.
+
+To run a scrape now:
+
+1. Open the **Actions** tab and pick **Scrape data**.
+2. Click **Run workflow**. To build only some tables, list them in the box, e.g. `production_by_country trade_fish_by_country`.
+3. When the run finishes, download the `aquaculture-data-<number>` artifact from the run's page. It holds every table as CSV and JSON and is kept for 90 days. The run summary shows the row count of each table.
+
+Optional: add a repository variable `SCRAPER_CONTACT` with your email or website (Settings → Secrets and variables → Actions → Variables). It is sent in the User-Agent so data owners can reach you. It is not a key, and the scrape runs without it.
+
+A run is marked failed if any table fails or is only partly collected; the files that were collected are still uploaded.
 
 ## Tests
 
