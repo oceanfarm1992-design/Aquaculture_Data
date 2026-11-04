@@ -40,12 +40,17 @@ def migration_tables() -> dict[str, tuple[list[str], list[str]]]:
             tables[name] = (pk, columns)
         for name, body in re.findall(r"alter table public\.(\w+)\s+(add column.*?);", sql, re.S):
             tables[name][1].extend(re.findall(r"add column if not exists (\w+)", body))
+        for name in re.findall(r"drop table if exists public\.(\w+)", sql):
+            tables.pop(name, None)
     return tables
 
 
 class MockSupabase(BaseHTTPRequestHandler):
-    received: dict = {}
-    requests: list = []
+    received: dict = {}       # table -> every row POSTed
+    store: dict = {}          # table -> {key: row}, like the real table
+    requests: list = []       # POSTs
+    reads: list = []          # GETs
+    no_hash_tables: set = set()   # tables created before the row_hash migration
 
     def log_message(self, *a):
         pass
@@ -61,7 +66,24 @@ class MockSupabase(BaseHTTPRequestHandler):
         if table == "missing_table":
             return self._send(404, {"code": "PGRST205", "message": "Could not find the table"})
         MockSupabase.received.setdefault(table, []).extend(body)
+        key_cols = lts.TABLES[table][0]
+        for row in body:
+            MockSupabase.store.setdefault(table, {})[tuple(str(row[c]) for c in key_cols)] = row
         self._send(201, None)
+
+    def do_GET(self):  # PostgREST select with order/limit/offset
+        u = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        table = u.path.rsplit("/", 1)[-1]
+        MockSupabase.reads.append({"table": table, "offset": int(q["offset"]), "limit": int(q["limit"])})
+        if self.headers.get("apikey") != "sb_secret_test":
+            return self._send(401, {"message": "Invalid API key"})
+        columns = q["select"].split(",")
+        if table in MockSupabase.no_hash_tables and "row_hash" in columns:
+            return self._send(400, {"code": "42703", "message": f"column {table}.row_hash does not exist"})
+        rows = [MockSupabase.store.get(table, {})[k] for k in sorted(MockSupabase.store.get(table, {}))]
+        page = rows[int(q["offset"]): int(q["offset"]) + int(q["limit"])]
+        self._send(200, [{c: r.get(c) for c in columns} for r in page])
 
     def _send(self, status, body):
         data = b"" if body is None else json.dumps(body).encode()
@@ -83,7 +105,8 @@ class LoaderTests(unittest.TestCase):
         cls.server.shutdown()
 
     def setUp(self):
-        MockSupabase.received, MockSupabase.requests = {}, []
+        MockSupabase.received, MockSupabase.requests, MockSupabase.reads = {}, [], []
+        MockSupabase.store, MockSupabase.no_hash_tables = {}, set()
         self.tmp = tempfile.TemporaryDirectory()
         self.data = Path(self.tmp.name)
         self.env = mock.patch.dict(os.environ, {"SUPABASE_URL": self.url + "/",
@@ -98,13 +121,59 @@ class LoaderTests(unittest.TestCase):
         (self.data / f"{table}.json").write_text(json.dumps(rows), encoding="utf-8")
 
     def test_loader_matches_migration(self):
-        expected = {t: (pk, [c for c in cols if c not in lts.DATABASE_COLUMNS])
+        not_scraped = lts.DATABASE_COLUMNS | {lts.HASH_COLUMN}
+        expected = {t: (pk, [c for c in cols if c not in not_scraped])
                     for t, (pk, cols) in migration_tables().items()}
         self.assertEqual(expected, lts.TABLES)
 
-    def test_every_table_records_first_seen(self):
+    def test_every_table_records_first_seen_and_row_hash(self):
         for table, (_, cols) in migration_tables().items():
             self.assertIn("first_seen_at", cols, table)
+            self.assertIn("row_hash", cols, table)
+
+    def companies(self, run, name_of_2="Fjord Laks AS"):
+        return [{"org_number": str(n), "company_name": name, "employees": 10.0 * n,
+                 "retrieved_at": f"2026-11-0{run}T03:00:00Z",        # changes every run
+                 "source_url": f"https://api.example/?page={run}"}    # can change every run
+                for n, name in [(1, "Havbruk AS"), (2, name_of_2), (3, "Skjell AS")]]
+
+    def test_second_identical_load_writes_nothing(self):
+        self.write("companies_norway", self.companies(1))
+        self.assertEqual(lts.main(["--data-dir", str(self.data), "--only", "companies_norway"]), 0)
+        self.assertEqual(len(MockSupabase.received["companies_norway"]), 3)
+        self.assertTrue(all(len(r["row_hash"]) == 32 for r in MockSupabase.received["companies_norway"]))
+
+        self.write("companies_norway", self.companies(2))   # same data, new download time and page
+        with self.assertLogs("load_to_supabase", "INFO") as logs:
+            self.assertEqual(lts.main(["--data-dir", str(self.data), "--only", "companies_norway"]), 0)
+        self.assertEqual(len(MockSupabase.received["companies_norway"]), 3)   # nothing more written
+        self.assertTrue(any("0 new, 0 changed, 3 unchanged" in m for m in logs.output))
+
+    def test_only_changed_rows_are_rewritten(self):
+        self.write("companies_norway", self.companies(1))
+        lts.main(["--data-dir", str(self.data), "--only", "companies_norway"])
+        self.write("companies_norway", self.companies(2, name_of_2="Fjord Laks Holding AS")
+                   + [{"org_number": "4", "company_name": "Ny Fisk AS"}])
+        lts.main(["--data-dir", str(self.data), "--only", "companies_norway"])
+        resent = MockSupabase.received["companies_norway"][3:]
+        self.assertEqual(sorted(r["company_name"] for r in resent), ["Fjord Laks Holding AS", "Ny Fisk AS"])
+
+    def test_existing_hashes_are_read_page_by_page(self):
+        self.write("companies_norway", self.companies(1))
+        lts.main(["--data-dir", str(self.data), "--only", "companies_norway"])
+        MockSupabase.reads.clear()
+        with mock.patch.object(lts, "READ_PAGE", 2):
+            lts.main(["--data-dir", str(self.data), "--only", "companies_norway"])
+        self.assertEqual([r["offset"] for r in MockSupabase.reads], [0, 2, 3])
+        self.assertEqual(len(MockSupabase.received["companies_norway"]), 3)   # still nothing re-sent
+
+    def test_table_without_row_hash_column_still_loads(self):
+        MockSupabase.no_hash_tables = {"companies_norway"}
+        self.write("companies_norway", self.companies(1))
+        self.assertEqual(lts.main(["--data-dir", str(self.data), "--only", "companies_norway"]), 0)
+        sent = MockSupabase.received["companies_norway"]
+        self.assertEqual(len(sent), 3)
+        self.assertNotIn("row_hash", sent[0])     # the old table has no such column
 
     def test_jsonb_columns_are_sent_as_objects(self):
         rows = lts.prepare_rows("facilities_europe", [{

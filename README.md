@@ -25,16 +25,15 @@ python run_all.py --contact you@example.org
 | Table | Data | Source |
 |---|---|---|
 | `fao_aquaculture_production` | Every country × species × area × environment × year since 1950, tonnes and USD | FAO FishStat |
-| `production_by_country` | Aquaculture, capture and total fisheries production, every country, since 1990 | World Bank (FAO data) |
+| `production_by_country` | Capture fisheries production, every country and region, since 1990 | World Bank (FAO data) |
 | `eurostat_aquaculture_production` | EU-27, Norway, Iceland: production by species, area and environment | Eurostat (`fish_aq2a`) |
 | `facilities_europe` | European aquaculture sites and areas (finfish, shellfish, …) with attributes and geometry | EMODnet Human Activities |
 | `facilities_norway` | Every Norwegian fish-farm site: name, species, lat/lon, capacity, licence holder | Fiskeridirektoratet Aquaculture Register |
 | `companies_norway` | Norwegian aquaculture companies: org number, employees, address, founding date | Brønnøysund Register Centre |
 | `prices_norway_salmon_export` | Weekly salmon export volume and price | Statistics Norway (table 03024) |
 | `trade_fish_by_country` | Fish and seafood imports and exports, Norway + UAE | UN Comtrade (public preview) |
-| `research_publications` | Scientific papers on aquaculture (last 35 days each run; accumulates) | OpenAlex |
-| `research_datasets` | Published aquaculture datasets (newest 1,000 each run; accumulates) | Zenodo |
-| `news_articles` | Aquaculture and fish-farming news (last 8 days each run; accumulates) | GDELT |
+| `research_publications` | Scientific papers and datasets on aquaculture (last 35 days each run; accumulates) | OpenAlex |
+| `news_articles` | Aquaculture and fish-farming news (last 2 days, daily; accumulates) | GDELT |
 
 UN Comtrade's keyless preview returns at most 500 rows per request, so the scraper sends one request per year. With the default products and both countries that is about 32 rows per year.
 
@@ -43,14 +42,18 @@ UN Comtrade's keyless preview returns at most 500 rows per request, so the scrap
 - **Private data:** daily feeding and mortality logs, batch and traceability records, costs and buyer contracts. These belong to farms and companies.
 - **Sources that need an account or key:** BarentsWatch (Norwegian lice and disease per site), USDA NASS, the full UN Comtrade API, Copernicus Marine. The bot is kept keyless.
 - **Social media and job sites:** their terms forbid scraping.
+- **Zenodo:** its robots.txt does not allow bots on its API. Zenodo datasets still appear in `research_publications`, which OpenAlex fills with papers and datasets alike (`type` = `dataset`).
+- **The same numbers twice:** the World Bank's aquaculture and total-production figures are FAO data already in `fao_aquaculture_production`, so only capture fisheries is taken from the World Bank. World Bank rows for years with no value yet are dropped. Eurostat overlaps FAO for European countries but adds euro values and EU-specific breakdowns, so both are kept.
 
 ## How data is kept
 
-Each weekly run keeps everything three ways:
+Each piece of data is stored once. Runs re-check their sources, but only what is new or has changed gets saved.
 
-1. **GitHub Releases (permanent).** Every run is published as a release named `data-<date>-run<number>`, holding every table as CSV and JSON in one zip. Releases don't expire, so this is the full history.
-2. **Supabase (optional).** Rows are upserted and never deleted. `first_seen_at` records when a row first appeared, and `retrieved_at` when it was last seen; a row whose `retrieved_at` stops advancing has disappeared from its source. Research and news accumulate run after run.
-3. **Workflow artifact (90 days).** A quick download from the run's page.
+1. **Supabase (optional, recommended).** Every row has a `row_hash`, a fingerprint of its data that ignores the download time and request URL. Before writing, the loader reads the stored hashes and sends only rows that are new or changed. The log reports this per table, for example `0 new, 2 changed, 193771 unchanged (not written)`. Nothing is deleted; `first_seen_at` records when each row first arrived.
+2. **GitHub Releases (permanent).** A weekly run stores only the tables whose content changed since the last archive, as zipped CSV. Each release's `manifest.json` lists every table, its fingerprint and the release that holds its latest version, so an unchanged FAO table, for example, is kept once and referenced afterwards. If nothing changed, no release is made. Daily runs (news and research) are archived this way only when Supabase is not set up.
+3. **7-day artifact.** Uploaded only when a run's data was not saved in either place, for example if the database load failed.
+
+JSON files are still written next to the CSVs during a run (the loader reads them), but the archive keeps one format.
 
 ## Running one source
 
@@ -64,7 +67,6 @@ python aquaculture_scraper.py --source fao_aquaculture
 python aquaculture_scraper.py --source eurostat --geo NO,ES,EL
 python aquaculture_scraper.py --source emodnet
 python aquaculture_scraper.py --source openalex --query "salmon lice" --since-days 365
-python aquaculture_scraper.py --source zenodo --query "recirculating aquaculture" --max-pages 10
 python aquaculture_scraper.py --source gdelt --timespan 30d
 ```
 
@@ -123,7 +125,7 @@ A run is marked failed if any table fails or is only partly collected; the files
 ## Staying up to date
 
 - **Data:** news and research refresh daily, and every other table weekly. FAO publishes a new release once a year; the scraper finds the newest one by itself.
-- **Libraries and actions:** `requirements.txt` pins exact versions, so every run uses a tested set. Each Tuesday, [Dependabot](.github/dependabot.yml) checks for new versions of the Python libraries and GitHub Actions and opens a pull request. The **Dependabot auto-merge** workflow tests it on Python 3.11 and 3.14 and merges minor and patch updates when the tests pass. Major updates get a comment and wait for you.
+- **Libraries and actions:** `requirements.txt` pins exact versions, so every run uses a tested set. Each Tuesday, [Dependabot](.github/dependabot.yml) checks for new versions of the Python libraries and GitHub Actions and opens a pull request. The **Dependabot auto-merge** workflow tests it on Python 3.11 and 3.14 and merges it when the tests pass and Dependabot reports a minor or patch update. Major updates, and grouped updates that Dependabot can't classify, get a comment and wait for you.
 - **When something breaks:** if a source changes its format, that table's step fails and GitHub emails you about the failed scheduled run. Paste the log into a new session to get it fixed.
 
 ## Storing data in Supabase
@@ -173,9 +175,9 @@ python -m unittest discover -v -p "test_*.py"
 
 ## Status
 
-All connectors are built from each API's documented response format and tested against mock servers, but **none has been run against the live APIs yet**. Things most likely to need adjusting on the first live run:
+The first live run (4 Nov 2026) collected FAO (193,773 rows), EMODnet (29,256), World Bank, Fiskeridir, Brønnøysund, Statistics Norway and UN Comtrade. Eurostat, OpenAlex past page 1, Zenodo and GDELT failed, and have since been fixed or removed. Things that may still need adjusting:
 
-- **Fiskeridir** field names.
+- **Fiskeridir:** species, company, org numbers and status came back empty in the first live run. The next run logs the first raw record of each source, which shows the real field names.
 - **FAO:** the release zip is looked up at `https://www.fao.org/fishery/static/Data/Aquaculture_<year>.1.<n>.zip` for the last four years. If FAO has renamed it, pass the zip link from the [download page](https://www.fao.org/fishery/en/collection/aquaculture) with `--url`. Columns and code lists are matched by name, and the log lists what was found if anything is missing.
 - **EMODnet:** layers are found by matching names and titles (`--layer-pattern`), so a renamed layer is still picked up.
 - **Brønnøysund:** if it has moved to the new SN2025 industry codes, pass them with `--nace`.
@@ -192,7 +194,6 @@ The license covers this code only. Data you collect stays under its source's own
 - **Norwegian government data:** NLOD.
 - **OpenAlex:** CC0.
 - **EMODnet:** CC BY 4.0.
-- **Zenodo:** each dataset has its own licence, stored in the `license` column.
 - **GDELT and UN Comtrade:** their own terms of use.
 
 Check the source's terms before republishing.

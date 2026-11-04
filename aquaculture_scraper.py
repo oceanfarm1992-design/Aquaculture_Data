@@ -19,8 +19,8 @@ Sources (--source):
                    farmed salmon. Open, no key.
 
   Any country — national level (default: Norway + UAE)
-    worldbank      Aquaculture production in tonnes per country per year
-                   (World Bank indicator ER.FSH.AQUA.MT, sourced from FAO). Open, no key.
+    worldbank      Fisheries indicators per country per year (World Bank WDI, FAO data),
+                   e.g. capture fisheries ER.FSH.CAPT.MT. Open, no key.
     comtrade       UN Comtrade fish and seafood trade (HS chapter 03) per country,
                    year, flow and product. Uses the keyless public preview (max 500
                    rows per request, so it sends one request per year).
@@ -36,9 +36,8 @@ Sources (--source):
                      (finfish, shellfish, ...) with site attributes and geometry.
 
   Research & news
-    openalex         OpenAlex: scientific publications matching --query (default
-                     "aquaculture") published in the last --since-days days.
-    zenodo           Zenodo: published datasets matching --query, newest first.
+    openalex         OpenAlex: scientific publications and datasets matching --query
+                     (default "aquaculture") published in the last --since-days days.
     gdelt            GDELT: news articles about aquaculture from the last --timespan.
 
   Generic
@@ -138,6 +137,10 @@ class SourceConfig:
     next_cursor_path: str | None = None  # cursor pagination: next-page token in the response
     cursor_start: str | None = None  # cursor pagination: token for the first page (e.g. "*")
     max_consecutive_failures: int = 3
+    drop_if_empty: str | None = None  # skip rows whose mapped column is empty (placeholders)
+    retry_on_429: bool = True  # let the HTTP layer retry 429s at once; False for strict APIs
+    rate_limit_wait: float = 30.0  # after a 429 that retries didn't fix: wait, then try again
+    rate_limit_retries: int = 2
     # Query-parameter names used by the paginators
     page_param: str = "page"
     size_param: str = "per_page"
@@ -203,13 +206,12 @@ BRREG_FIELDS: FieldMap = {
 }
 
 WORLDBANK_FIELDS: FieldMap = {
-    "country_iso3": ["countryiso3code"],
+    "country_iso3": ["countryiso3code", "country.id"],  # some regions have no ISO3 code
     "country": ["country.value"],
     "year": ["date"],
     "indicator_id": ["indicator.id"],
     "indicator": ["indicator.value"],
     "value": ["value"],
-    "unit": ["unit"],
 }
 
 COMTRADE_FIELDS: FieldMap = {
@@ -278,25 +280,25 @@ OPENALEX_FIELDS: FieldMap = {
     "landing_page_url": ["primary_location.landing_page_url"],
 }
 
-ZENODO_FIELDS: FieldMap = {
-    "zenodo_id": ["id"], "doi": ["doi", "metadata.doi"], "title": ["metadata.title", "title"],
-    "publication_date": ["metadata.publication_date"],
-    "resource_type": ["metadata.resource_type.title", "metadata.resource_type.type"],
-    "creators": ["metadata.creators[*].name"], "keywords": ["metadata.keywords[*]"],
-    "license": ["metadata.license.id", "metadata.license"],
-    "landing_page_url": ["links.self_html", "links.html"],
-}
-
 GDELT_FIELDS: FieldMap = {
     "url": ["url"], "title": ["title"], "seen_date": ["seendate"], "domain": ["domain"],
     "language": ["language"], "source_country": ["sourcecountry"], "image_url": ["socialimage"],
 }
 
+def eurostat_periods(today: date | None = None, start: int = 2008, block: int = 4) -> list[tuple[int, int]]:
+    """Year blocks for Eurostat requests: one country's full cube is over the API's
+    5-million-cell limit, so each request asks for one country and a few years."""
+    end = (today or date.today()).year
+    return [(y, min(y + block - 1, end)) for y in range(start, end + 1, block)]
+
+
 # EU-27 plus Norway and Iceland (Eurostat geo codes; Greece is EL)
 EUROSTAT_GEO = ("AT BE BG CY CZ DE DK EE EL ES FI FR HR HU IE IT LT LU LV MT NL PL PT RO SE "
                 "SI SK NO IS").split()
 
-WORLDBANK_FISHERY_INDICATORS = "ER.FSH.AQUA.MT;ER.FSH.CAPT.MT;ER.FSH.PROD.MT"
+# Capture fisheries only: aquaculture (ER.FSH.AQUA.MT) and total production (ER.FSH.PROD.MT)
+# are FAO numbers already in fao_aquaculture_production, in more detail
+WORLDBANK_FISHERY_INDICATORS = "ER.FSH.CAPT.MT"
 
 OBIS_FIELDS: FieldMap = {
     "record_id": ["id"],
@@ -396,7 +398,7 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             url=f"https://api.worldbank.org/v2/country/{countries}/indicator/{indicator}",
             pagination="page", page_size=1000, records_path="[1]", pages_path="[0].pages",
             total_path="[0].total", missing_records_is_empty=True, params=params,
-            field_map=WORLDBANK_FIELDS, table="production_by_country",
+            field_map=WORLDBANK_FIELDS, table="production_by_country", drop_if_empty="value",
             reference_url=f"https://data.worldbank.org/indicator/{indicator.split(';')[0]}")
     elif s == "fao_aquaculture":
         import bulk_sources
@@ -408,12 +410,14 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             reference_url="https://www.fao.org/fishery/en/collection/aquaculture")
     elif s == "eurostat":
         geo = args.geo.split(",") if args.geo else EUROSTAT_GEO
+        requests_ = [{"geo": g, "sinceTimePeriod": str(a), "untilTimePeriod": str(b)}
+                     for g in geo for a, b in eurostat_periods()]
         cfg = SourceConfig(
             name="Eurostat fish_aq2a (aquaculture production)",
             url="https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/fish_aq2a",
-            pagination="values", iterate_param="geo", iterate_values=geo, parser="jsonstat",
+            pagination="values", iterate_values=requests_, parser="jsonstat",
             params={"format": "JSON", "lang": "EN"}, field_map=EUROSTAT_FIELDS, id_field="cell_key",
-            max_consecutive_failures=10, table="eurostat_aquaculture_production",
+            max_consecutive_failures=30, table="eurostat_aquaculture_production",
             reference_url="https://ec.europa.eu/eurostat/databrowser/view/fish_aq2a/default/table")
     elif s == "emodnet":
         import bulk_sources
@@ -421,7 +425,8 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             name="EMODnet Human Activities (aquaculture layers)",
             url="https://ows.emodnet-humanactivities.eu/wfs", pagination="none", page_size=1000,
             params={"layer_pattern": args.layer_pattern or
-                    r"aquacult|finfish|shellfish|mussel|oyster|mollus|fish.?farm|seaweed|algae"},
+                    r"aquacult|finfish|shellfish|mussel|oyster|mollus|fish.?farm|seaweed|algae",
+                    "layer_exclude": r"advisory"},  # advisory-council areas are not farm sites
             custom_fetch=bulk_sources.fetch_wfs_layers, field_map=EMODNET_FIELDS,
             id_field="feature_id", table="facilities_europe",
             reference_url="https://emodnet.ec.europa.eu/en/human-activities")
@@ -431,22 +436,15 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
                   "filter": f"from_publication_date:{since}", "sort": "publication_date:desc"}
         if args.contact and "@" in args.contact:
             params["mailto"] = args.contact  # OpenAlex's "polite pool" for identified clients
+        # Page numbers, not cursors: cursor paging past page 1 needs an API key, while
+        # page=N works without one for the first 10,000 results
         cfg = SourceConfig(
             name="OpenAlex (scholarly works)", url="https://api.openalex.org/works",
-            pagination="cursor", records_path="results", page_size=200, size_param="per-page",
-            cursor_param="cursor", cursor_start="*", next_cursor_path="meta.next_cursor",
-            total_path="meta.count", params=params, field_map=OPENALEX_FIELDS, id_field="id",
+            pagination="page", records_path="results", page_size=200, page_param="page",
+            size_param="per-page", total_path="meta.count", missing_records_is_empty=True,
+            params=params, field_map=OPENALEX_FIELDS, id_field="id",
             table="research_publications", reference_url="https://openalex.org/",
             record_url=lambda r: r.get("doi") or r.get("id"))
-    elif s == "zenodo":
-        cfg = SourceConfig(
-            name="Zenodo (research datasets)", url="https://zenodo.org/api/records",
-            pagination="page", page_size=25, page_param="page", size_param="size",
-            records_path="hits.hits", total_path="hits.total", missing_records_is_empty=True,
-            params={"q": args.query or "aquaculture", "type": "dataset", "sort": "mostrecent"},
-            field_map=ZENODO_FIELDS, id_field="id", table="research_datasets",
-            reference_url="https://zenodo.org/",
-            record_url=lambda r: get_path(r, "links.self_html") or get_path(r, "links.html"))
     elif s == "gdelt":
         query = args.query or '(aquaculture OR "fish farm" OR "fish farming" OR mariculture OR "salmon farming")'
         cfg = SourceConfig(
@@ -455,6 +453,7 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             params={"query": query, "mode": "artlist", "format": "json", "maxrecords": "250",
                     "timespan": args.timespan, "sort": "DateDesc"},
             field_map=GDELT_FIELDS, id_field="url", table="news_articles",
+            retry_on_429=False, rate_limit_wait=10.0, rate_limit_retries=3,  # max 1 request / 5 s
             reference_url="https://www.gdeltproject.org/", record_url=lambda r: r.get("url"))
     elif s == "comtrade":
         reporters = args.reporters or ",".join(COUNTRY_CODES.values())
@@ -656,14 +655,14 @@ def jsonstat_to_records(body: Any) -> list[dict] | None:
 # --------------------------------------------------------------------------------------
 # HTTP
 # --------------------------------------------------------------------------------------
-def create_session(user_agent: str) -> requests.Session:
+def create_session(user_agent: str, retry_on_429: bool = True) -> requests.Session:
     retries = Retry(
         total=5,
         connect=3,
         read=3,
         backoff_factor=1.5,          # waits about 0s, 3s, 6s, 12s, 24s between attempts
         backoff_jitter=0.5,
-        status_forcelist=RETRY_STATUSES,
+        status_forcelist=RETRY_STATUSES if retry_on_429 else tuple(c for c in RETRY_STATUSES if c != 429),
         # POST is included because the POST APIs used here are read-only queries
         allowed_methods=frozenset({"GET", "HEAD", "POST"}),
         respect_retry_after_header=True,  # honour 429/503 Retry-After from the server
@@ -698,7 +697,9 @@ def robots_allows(session: requests.Session, url: str, user_agent: str) -> bool:
 
 
 class FetchError(Exception):
-    pass
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
 
 
 def fetch_json(session: requests.Session, url: str, params: dict, *, method: str = "GET",
@@ -713,7 +714,8 @@ def fetch_json(session: requests.Session, url: str, params: dict, *, method: str
         raise FetchError(f"network error: {exc}") from exc
 
     if resp.status_code >= 400:
-        raise FetchError(f"HTTP {resp.status_code} from {resp.url}: {resp.text[:200]!r}")
+        raise FetchError(f"HTTP {resp.status_code} from {resp.url}: {resp.text[:200]!r}",
+                         status=resp.status_code)
     try:
         body = resp.json()
     except ValueError as exc:
@@ -887,12 +889,14 @@ class ValuesPaginator(Paginator):  # one request per value, e.g. per year: ?peri
 
     def __init__(self, cfg):
         super().__init__(cfg)
-        if not cfg.iterate_param or not cfg.iterate_values:
+        if not cfg.iterate_values or (not cfg.iterate_param and
+                                      not all(isinstance(v, dict) for v in cfg.iterate_values)):
             raise SystemExit("values pagination needs a parameter and a list of values")
         self.i = 0
 
     def params(self):
-        return {self.cfg.iterate_param: self.cfg.iterate_values[self.i]}
+        value = self.cfg.iterate_values[self.i]
+        return dict(value) if isinstance(value, dict) else {self.cfg.iterate_param: value}
 
     def extra_fields(self):
         return {}
@@ -922,6 +926,7 @@ class ScrapeResult:
     pages_failed: int = 0
     records_skipped: int = 0
     duplicates: int = 0
+    empty_rows: int = 0  # placeholder rows without a value (e.g. years not yet reported)
     interrupted: bool = False
 
 
@@ -958,6 +963,28 @@ def polite_sleep(delay: float) -> None:
         time.sleep(delay + random.uniform(0, delay * 0.5))  # jitter spreads load
 
 
+def _fetch_with_rate_limit(session, cfg: SourceConfig, url: str, params: dict) -> tuple[Any, str]:
+    """fetch_json, but when the API still says 429 (too many requests), wait and try again."""
+    for attempt in range(cfg.rate_limit_retries + 1):
+        try:
+            return fetch_json(session, url, params, method=cfg.method, json_body=cfg.json_body)
+        except FetchError as exc:
+            if exc.status != 429 or attempt == cfg.rate_limit_retries:
+                raise
+            wait = cfg.rate_limit_wait * (attempt + 1)
+            log.warning("Rate limited (HTTP 429); waiting %.0fs before trying again.", wait)
+            time.sleep(wait)
+    raise AssertionError("unreachable")
+
+
+def _log_raw_sample(cfg: SourceConfig, raw_records: list) -> None:
+    """Log the first raw record once per run, so field names can be checked from the log."""
+    if cfg.field_map and raw_records:
+        sample = json.dumps(raw_records[0], ensure_ascii=False, default=str)
+        log.info("First raw record (to check field names): %s%s", sample[:2000],
+                 " ..." if len(sample) > 2000 else "")
+
+
 def _scrape_bulk(cfg: SourceConfig, session: requests.Session, delay: float) -> ScrapeResult:
     """Sources with their own fetcher (bulk files, map services)."""
     result = ScrapeResult()
@@ -974,6 +1001,7 @@ def _scrape_bulk(cfg: SourceConfig, session: requests.Session, delay: float) -> 
         return result
     result.pages_failed = failed
     result.pages_ok = 1
+    _log_raw_sample(cfg, [raw for raw, _ in pairs[:1]])
     for i, (raw, url) in enumerate(pairs):
         try:
             row, key = parse_record(raw, cfg, url)
@@ -1017,8 +1045,7 @@ def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
             log.info("Fetching %s...", label)
 
             try:
-                body, page_url = fetch_json(session, url, params, method=cfg.method,
-                                            json_body=cfg.json_body)
+                body, page_url = _fetch_with_rate_limit(session, cfg, url, params)
                 raw_records = extract_records(body, cfg)
                 if raw_records is None:
                     keys = list(body)[:10] if isinstance(body, dict) else type(body).__name__
@@ -1055,6 +1082,8 @@ def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
                     break
                 continue
 
+            if page_no == 1:
+                _log_raw_sample(cfg, raw_records)
             parsed = skipped = new = 0
             for i, raw in enumerate(raw_records):
                 try:
@@ -1064,6 +1093,10 @@ def scrape(cfg: SourceConfig, session: requests.Session, *, max_pages: int,
                     log.warning("Skipping record %d on %s: %s: %s", i, label, type(exc).__name__, exc)
                     continue
                 parsed += 1
+                if cfg.drop_if_empty and _is_empty(row.get(cfg.drop_if_empty)):
+                    result.empty_rows += 1
+                    new += 1  # a real record, just without a value yet
+                    continue
                 if key is not None:
                     if key in seen_keys:
                         result.duplicates += 1
@@ -1168,7 +1201,7 @@ def save_outputs(df: pd.DataFrame, out_dir: Path, basename: str) -> tuple[Path, 
 # CLI
 # --------------------------------------------------------------------------------------
 SOURCES = ["fiskeridir", "brreg", "ssb_salmon", "worldbank", "comtrade", "fao_aquaculture",
-           "eurostat", "emodnet", "openalex", "zenodo", "gdelt", "obis", "arcgis", "custom"]
+           "eurostat", "emodnet", "openalex", "gdelt", "obis", "arcgis", "custom"]
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1192,7 +1225,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--species", help="obis: scientific name, e.g. 'Salmo salar'")
     g.add_argument("--geo", help="eurostat: country codes, e.g. NO,ES,EL (default EU-27 + NO + IS)")
     g.add_argument("--layer-pattern", help="emodnet: regex for the layers to download")
-    g.add_argument("--query", help="openalex / zenodo / gdelt: search terms")
+    g.add_argument("--query", help="openalex / gdelt: search terms")
     g.add_argument("--since-days", type=int, default=30,
                    help="openalex: publications from the last N days (default 30)")
     g.add_argument("--timespan", default="7d", help="gdelt: how far back, e.g. 7d, 2w, 3m (default 7d)")
@@ -1245,7 +1278,7 @@ def main(argv: list[str] | None = None) -> int:
     user_agent = (f"AquacultureDataBot/{__version__} (research data collection; "
                   f"contact: {args.contact or 'not provided'}) python-requests/{requests.__version__}")
 
-    session = create_session(user_agent)
+    session = create_session(user_agent, retry_on_429=cfg.retry_on_429)
     if not args.ignore_robots and not robots_allows(session, cfg.url.split("{", 1)[0], user_agent):
         log.error("robots.txt disallows %s for this bot. Stopping (use --ignore-robots only "
                   "if the data owner has given you permission).", cfg.url)
@@ -1262,8 +1295,8 @@ def main(argv: list[str] | None = None) -> int:
     csv_path, json_path = save_outputs(df, Path(args.out_dir), args.basename)
     log.info("Saved %d records × %d columns to %s and %s", len(df), df.shape[1], csv_path, json_path)
     log.info("Summary: %d pages ok, %d pages failed, %d records skipped, %d duplicates removed, "
-             "%.1fs elapsed.", result.pages_ok, result.pages_failed, result.records_skipped,
-             result.duplicates, time.monotonic() - started)
+             "%d empty placeholder rows dropped, %.1fs elapsed.", result.pages_ok, result.pages_failed,
+             result.records_skipped, result.duplicates, result.empty_rows, time.monotonic() - started)
 
     return 1 if (result.pages_failed or result.interrupted) else 0
 

@@ -1,10 +1,12 @@
 name: Scrape data
 
-# Builds every table with run_all.py, then keeps it three ways:
-#   1. a GitHub Release per run (permanent archive of every table, CSV + JSON, zipped)
-#   2. a workflow artifact (90 days)
-#   3. Supabase, if SUPABASE_URL and the SUPABASE_SERVICE_ROLE_KEY secret are set
-#      (rows are upserted and never deleted; see README)
+# Builds the tables with run_all.py, then keeps each piece of data once:
+#   - Supabase (if SUPABASE_URL and the SUPABASE_SERVICE_ROLE_KEY secret are set): only
+#     new or changed rows are written; nothing is deleted
+#   - GitHub Releases (weekly runs, and daily runs when Supabase is not set up): only
+#     tables whose content changed since the last archive are stored, as CSV; a
+#     manifest.json in each release says which release holds every table
+#   - a 7-day artifact only when the run's data was not saved either way
 # The data sources need no API keys.
 # Optional: set a repository variable SCRAPER_CONTACT
 # (Settings > Secrets and variables > Actions > Variables) to an email or URL that
@@ -53,7 +55,7 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
         run: |
           if [ "$SCHEDULE" = "43 5 * * 0,2-6" ]; then
-            TABLES="news_articles research_publications research_datasets"
+            TABLES="news_articles research_publications"
           fi
           if [ -n "$TABLES" ]; then
             python run_all.py --out-dir data --only $TABLES
@@ -76,6 +78,7 @@ jobs:
           fi
 
       - name: Load into Supabase
+        id: load
         if: ${{ !cancelled() && steps.supabase.outputs.configured == 'true' }}
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL || secrets.SUPABASE_URL }}
@@ -98,9 +101,13 @@ jobs:
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
               out.write("\n".join(lines) + "\n")
 
-      - name: Archive this run as a GitHub Release
-        # full runs only (the weekly schedule, or a manual run of every table)
-        if: ${{ !cancelled() && hashFiles('data/*.csv') != '' && github.event.schedule != '43 5 * * 0,2-6' && inputs.tables == '' }}
+      - name: Archive changed tables as a GitHub Release
+        id: archive
+        # weekly full runs; daily runs too when there is no database to keep them
+        if: >-
+          ${{ !cancelled() && hashFiles('data/*.json') != '' &&
+              ((github.event.schedule != '43 5 * * 0,2-6' && inputs.tables == '') ||
+               steps.supabase.outputs.configured != 'true') }}
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -108,24 +115,38 @@ jobs:
         run: |
           stamp=$(date -u +%Y-%m-%d)
           tag="data-${stamp}-run${RUN_NUMBER}"
+          # manifest of the most recent archive, to compare against
+          prev=$(gh release list --limit 100 --json tagName,publishedAt \
+                   --jq '[.[] | select(.tagName | startswith("data-"))] | sort_by(.publishedAt) | last | .tagName // empty')
+          rm -f previous_manifest.json
+          if [ -n "$prev" ]; then
+            gh release download "$prev" --pattern manifest.json --output previous_manifest.json \
+              || echo "Release $prev has no manifest.json; every table counts as new this time."
+          fi
+          python archive.py --data-dir data --previous previous_manifest.json --tag "$tag" --run-url "$RUN_URL"
+          if [ ! -s changed.txt ]; then
+            echo "Nothing changed since ${prev}; no release made (nothing is stored twice)." >> "$GITHUB_STEP_SUMMARY"
+            echo "archived=unchanged" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           zipfile="aquaculture-data-${stamp}-run${RUN_NUMBER}.zip"
-          (cd data && zip -q -9 "../${zipfile}" ./*.csv ./*.json)
-          {
-            echo "Every table scraped by run #${RUN_NUMBER} on ${stamp}, as CSV and JSON."
-            echo
-            echo "Row counts and logs: ${RUN_URL}"
-            echo
-            echo "Each row records where it came from (source_url, record_url, reference_url)."
-          } > notes.md
-          gh release create "$tag" "$zipfile" --target "$GITHUB_SHA" \
+          (cd data && zip -q -9 "../${zipfile}" $(sed 's/$/.csv/' ../changed.txt))
+          gh release create "$tag" "$zipfile" manifest.json --target "$GITHUB_SHA" \
             --title "Data snapshot ${stamp} (run ${RUN_NUMBER})" --notes-file notes.md --latest=false
-          echo "Archived as release ${tag}" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Archived $(wc -l < changed.txt) changed table(s) as release ${tag}:"
+            sed 's/^/- /' changed.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "archived=true" >> "$GITHUB_OUTPUT"
 
-      - name: Upload data
-        if: always()
+      - name: Upload data (only if it was not saved anywhere else)
+        if: >-
+          ${{ always() && steps.archive.outputs.archived != 'true' &&
+              steps.archive.outputs.archived != 'unchanged' &&
+              (steps.supabase.outputs.configured != 'true' || steps.load.outcome != 'success') }}
         uses: actions/upload-artifact@v7
         with:
           name: aquaculture-data-${{ github.run_number }}
           path: data/
           if-no-files-found: warn
-          retention-days: 90
+          retention-days: 7

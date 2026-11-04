@@ -43,17 +43,23 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Merge minor and patch updates
-        if: steps.meta.outputs.update-type != 'version-update:semver-major'
+        # only when Dependabot reports a minor or patch update; grouped updates that mix
+        # versions report no single type and wait for review like major ones
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-minor' ||
+          steps.meta.outputs.update-type == 'version-update:semver-patch'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh pr merge --squash --delete-branch "$PR_URL"
 
       - name: Ask for review of major updates
-        if: steps.meta.outputs.update-type == 'version-update:semver-major'
+        if: >-
+          steps.meta.outputs.update-type != 'version-update:semver-minor' &&
+          steps.meta.outputs.update-type != 'version-update:semver-patch'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEPS: ${{ steps.meta.outputs.dependency-names }}
         run: |
-          gh pr comment "$PR_URL" --body "This is a **major** update (${DEPS}). The tests passed, but major versions can change behaviour, so it was not merged automatically. Check the release notes, then merge it by hand."
+          gh pr comment "$PR_URL" --body "This update (${DEPS}) is a major version, or a group whose version change could not be classified. The tests passed, but such updates can change behaviour, so it was not merged automatically. Check the release notes, then merge it by hand."
