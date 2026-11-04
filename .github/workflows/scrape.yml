@@ -1,8 +1,11 @@
 name: Scrape data
 
-# Builds every table with run_all.py and saves them as a downloadable artifact.
-# The data sources need no API keys. If SUPABASE_URL and the SUPABASE_SERVICE_ROLE_KEY
-# secret are set, the tables are also upserted into Supabase (see README).
+# Builds every table with run_all.py, then keeps it three ways:
+#   1. a GitHub Release per run (permanent archive of every table, CSV + JSON, zipped)
+#   2. a workflow artifact (90 days)
+#   3. Supabase, if SUPABASE_URL and the SUPABASE_SERVICE_ROLE_KEY secret are set
+#      (rows are upserted and never deleted; see README)
+# The data sources need no API keys.
 # Optional: set a repository variable SCRAPER_CONTACT
 # (Settings > Secrets and variables > Actions > Variables) to an email or URL that
 # data owners can use to reach you; it is sent in the User-Agent.
@@ -27,7 +30,9 @@ concurrency:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
+    permissions:
+      contents: write   # to publish the run's data as a GitHub Release
     steps:
       - uses: actions/checkout@v4
 
@@ -81,12 +86,34 @@ jobs:
           files = sorted(pathlib.Path("data").glob("*.csv"))
           lines = ["## Scraped tables", "", "| File | Rows | Columns |", "|---|---|---|"]
           for f in files:
-              df = pd.read_csv(f)
+              df = pd.read_csv(f, low_memory=False)
               lines.append(f"| `{f.name}` | {len(df)} | {df.shape[1]} |")
           if not files:
               lines.append("| (no files written) | | |")
           with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as out:
               out.write("\n".join(lines) + "\n")
+
+      - name: Archive this run as a GitHub Release
+        if: ${{ !cancelled() && hashFiles('data/*.csv') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          stamp=$(date -u +%Y-%m-%d)
+          tag="data-${stamp}-run${RUN_NUMBER}"
+          zipfile="aquaculture-data-${stamp}-run${RUN_NUMBER}.zip"
+          (cd data && zip -q -9 "../${zipfile}" ./*.csv ./*.json)
+          {
+            echo "Every table scraped by run #${RUN_NUMBER} on ${stamp}, as CSV and JSON."
+            echo
+            echo "Row counts and logs: ${RUN_URL}"
+            echo
+            echo "Each row records where it came from (source_url, record_url, reference_url)."
+          } > notes.md
+          gh release create "$tag" "$zipfile" --target "$GITHUB_SHA" \
+            --title "Data snapshot ${stamp} (run ${RUN_NUMBER})" --notes-file notes.md --latest=false
+          echo "Archived as release ${tag}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload data
         if: always()

@@ -98,7 +98,21 @@ class LoaderTests(unittest.TestCase):
         (self.data / f"{table}.json").write_text(json.dumps(rows), encoding="utf-8")
 
     def test_loader_matches_migration(self):
-        self.assertEqual(migration_tables(), lts.TABLES)
+        expected = {t: (pk, [c for c in cols if c not in lts.DATABASE_COLUMNS])
+                    for t, (pk, cols) in migration_tables().items()}
+        self.assertEqual(expected, lts.TABLES)
+
+    def test_every_table_records_first_seen(self):
+        for table, (_, cols) in migration_tables().items():
+            self.assertIn("first_seen_at", cols, table)
+
+    def test_jsonb_columns_are_sent_as_objects(self):
+        rows = lts.prepare_rows("facilities_europe", [{
+            "layer": "emodnet:finfish", "feature_id": "finfish.1",
+            "properties": '{"name": "Site 1"}', "geometry": '{"type": "Point", "coordinates": [5, 60]}'}])
+        self.assertEqual(rows[0]["properties"], {"name": "Site 1"})
+        self.assertEqual(rows[0]["geometry"]["type"], "Point")
+        self.assertNotIn("first_seen_at", rows[0])
 
     def test_every_run_all_table_has_a_database_table(self):
         import run_all

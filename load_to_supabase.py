@@ -11,7 +11,8 @@ The tables must already exist: they are created by the SQL files in
 supabase/migrations/ (apply them in filename order).
 
 Rows are upserted on each table's primary key, so loading the same scrape twice
-updates rows instead of duplicating them. Uses Supabase's REST API (PostgREST) over
+updates rows instead of duplicating them. Nothing is ever deleted, and the database
+records when each row was first seen (first_seen_at). Uses Supabase's REST API (PostgREST) over
 HTTPS, so no database driver is needed. The key bypasses Row Level Security: keep it
 in a GitHub secret or an environment variable, never in a file in the repo.
 """
@@ -61,7 +62,38 @@ TABLES: dict[str, tuple[list[str], list[str]]] = {
         ["year", "reporter_code", "flow_code", "partner_code", "hs_code", "reporter_iso3",
          "reporter", "flow", "partner", "commodity", "net_weight_kg", "quantity",
          "quantity_unit", "trade_value_usd", "source", "retrieved_at", "source_url", "record_url", "reference_url"]),
+    "fao_aquaculture_production": (
+        ["cell_key"],
+        ["cell_key", "country_un_code", "country_iso3", "country", "species_code", "species",
+         "scientific_name", "species_group", "area_code", "area", "environment_code", "environment",
+         "measure", "year", "value", "status", "source", "source_url", "record_url", "reference_url", "retrieved_at"]),
+    "eurostat_aquaculture_production": (
+        ["cell_key"],
+        ["cell_key", "geo", "country", "species_code", "species", "area_code", "area",
+         "environment_code", "environment", "unit_code", "unit", "year", "value", "source", "source_url", "record_url", "reference_url", "retrieved_at"]),
+    "facilities_europe": (
+        ["layer", "feature_id"],
+        ["layer", "feature_id", "layer_title", "name", "country", "species", "status", "geometry_type",
+         "latitude", "longitude", "properties", "geometry", "source", "source_url", "record_url", "reference_url", "retrieved_at"]),
+    "research_publications": (
+        ["openalex_id"],
+        ["openalex_id", "doi", "title", "publication_year", "publication_date", "type", "language",
+         "journal", "authors", "institutions", "countries", "topics", "cited_by_count",
+         "is_open_access", "open_access_url", "landing_page_url", "source", "source_url", "record_url", "reference_url", "retrieved_at"]),
+    "research_datasets": (
+        ["zenodo_id"],
+        ["zenodo_id", "doi", "title", "publication_date", "resource_type", "creators", "keywords",
+         "license", "landing_page_url", "source", "source_url", "record_url", "reference_url", "retrieved_at"]),
+    "news_articles": (
+        ["url"],
+        ["url", "title", "seen_date", "domain", "language", "source_country", "image_url", "source", "source_url", "record_url", "reference_url", "retrieved_at"]),
 }
+
+# Columns stored as jsonb: the scraper writes them as JSON text, the database wants objects
+JSONB_COLUMNS: dict[str, set[str]] = {"facilities_europe": {"properties", "geometry"}}
+
+# Filled in by the database (never sent, so upserts never overwrite them)
+DATABASE_COLUMNS = {"first_seen_at"}
 
 
 class LoadError(Exception):
@@ -77,9 +109,19 @@ def _clean_value(value: Any) -> Any:
     return value
 
 
+def _as_json(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return value
+    return value
+
+
 def prepare_rows(table: str, records: list[dict]) -> list[dict]:
     """Keep only the table's columns, drop rows missing a key, and de-duplicate on the key."""
     key_cols, columns = TABLES[table]
+    jsonb = JSONB_COLUMNS.get(table, set())
     extra = sorted({c for r in records for c in r} - set(columns))
     if extra:
         log.info("%s: ignoring columns not in the database table: %s", table, extra)
@@ -88,6 +130,8 @@ def prepare_rows(table: str, records: list[dict]) -> list[dict]:
     missing_key = 0
     for record in records:
         row = {c: _clean_value(record.get(c)) for c in columns}
+        for c in jsonb:
+            row[c] = _as_json(row[c])
         key = tuple(row[c] for c in key_cols)
         if any(k is None or k == "" for k in key):
             missing_key += 1

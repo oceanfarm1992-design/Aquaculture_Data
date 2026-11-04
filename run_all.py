@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_all.py — build every linked table for Norway and the UAE into one folder.
+run_all.py — build every table (global, regional, Norway, UAE, research, news) into one folder.
 
     python run_all.py --contact you@example.org             # all tables into ./data
     python run_all.py --contact you@example.org --only production_by_country trade_fish_by_country
@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import time
+from datetime import date
 
 import aquaculture_scraper as aq
 
@@ -27,10 +28,24 @@ JOBS: dict[str, tuple[list[str], str]] = {
                          "Norway: aquaculture companies (company register)"),
     "prices_norway_salmon_export": (["--source", "ssb_salmon", "--last-weeks", "104"],
                                     "Norway: weekly salmon export volume and price"),
-    "production_by_country": (["--source", "worldbank", "--countries", "NOR;ARE"],
-                              "Norway + UAE: aquaculture production, tonnes per year"),
+    "production_by_country": (["--source", "worldbank", "--countries", "all",
+                               "--indicator", aq.WORLDBANK_FISHERY_INDICATORS,
+                               "--years", f"1990:{date.today().year}"],
+                              "All countries: aquaculture, capture and total fisheries, tonnes per year"),
     "trade_fish_by_country": (["--source", "comtrade", "--reporters", "578,784"],
                               "Norway + UAE: fish and seafood imports/exports (HS 03)"),
+    "fao_aquaculture_production": (["--source", "fao_aquaculture"],
+                                   "All countries: FAO production by species, area and environment since 1950"),
+    "eurostat_aquaculture_production": (["--source", "eurostat"],
+                                        "EU-27 + Norway + Iceland: production by species (Eurostat)"),
+    "facilities_europe": (["--source", "emodnet"],
+                          "Europe: aquaculture sites and areas with geometry (EMODnet)"),
+    "research_publications": (["--source", "openalex", "--since-days", "35"],
+                              "Scientific papers on aquaculture from the last 35 days (OpenAlex)"),
+    "research_datasets": (["--source", "zenodo", "--max-pages", "40"],
+                          "The 1,000 newest aquaculture datasets on Zenodo"),
+    "news_articles": (["--source", "gdelt", "--timespan", "8d"],
+                      "Aquaculture news from the last 8 days (GDELT)"),
 }
 
 

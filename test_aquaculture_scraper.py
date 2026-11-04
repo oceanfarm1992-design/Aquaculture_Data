@@ -39,6 +39,68 @@ JSONSTAT = {  # 2 products x 2 measures x 2 weeks, in JSON-stat 2.0 form
 }
 
 
+def fao_zip_bytes() -> bytes:
+    """A small FAO-style release: data files plus code lists."""
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("Aquaculture_Quantity.csv",
+                   "COUNTRY.UN_CODE,SPECIES.ALPHA_3_CODE,AREA.CODE,ENVIRONMENT.ALPHA_2_CODE,MEASURE,PERIOD,VALUE,STATUS\n"
+                   "578,SAL,27,MA,Q_tlw,2023,1500000,A\n"
+                   "784,GIT,51,MA,Q_tlw,2023,1200,E\n"
+                   "784,GIT,51,MA,Q_tlw,2023,1200,E\n")  # duplicate row
+        z.writestr("Aquaculture_Value.csv",
+                   "COUNTRY.UN_CODE,SPECIES.ALPHA_3_CODE,AREA.CODE,ENVIRONMENT.ALPHA_2_CODE,MEASURE,PERIOD,VALUE,STATUS\n"
+                   "578,SAL,27,MA,V_USD_1000,2023,9800000,A\n")
+        z.writestr("CL_FI_COUNTRY_GROUPS.csv", "UN_Code,ISO2_Code,ISO3_Code,Name_En\n578,NO,NOR,Norway\n784,AE,ARE,United Arab Emirates\n")
+        z.writestr("CL_FI_SPECIES_GROUPS.csv",
+                   "3A_Code,Scientific_Name,Name_En,ISSCAAP_Group_En\nSAL,Salmo salar,Atlantic salmon,\"Salmons, trouts, smelts\"\n"
+                   "GIT,Sparidae,Porgies,Miscellaneous coastal fishes\n")
+        z.writestr("CL_FI_WATERAREA_GROUPS.csv", "Code,Name_En\n27,\"Atlantic, Northeast\"\n51,\"Indian Ocean, Western\"\n")
+        z.writestr("CL_FI_ENVIRONMENT.csv", "Alpha_2_Code,Name_En\nMA,Marine\n")
+    return buf.getvalue()
+
+
+def eurostat_cube(geo):
+    return {"version": "2.0", "class": "dataset", "id": ["species", "unit", "geo", "time"], "size": [2, 1, 1, 2],
+            "dimension": {
+                "species": {"category": {"index": {"SAL": 0, "MSM": 1}, "label": {"SAL": "Atlantic salmon", "MSM": "Mussels"}}},
+                "unit": {"category": {"index": {"TLW": 0}, "label": {"TLW": "Tonnes live weight"}}},
+                "geo": {"category": {"index": {geo: 0}, "label": {geo: f"Country {geo}"}}},
+                "time": {"category": {"index": {"2022": 0, "2023": 1}}}},
+            "value": {"0": 100.0, "1": 110.0, "3": 7.5}}
+
+
+def openalex_work(i):
+    return {"id": f"https://openalex.org/W{i}", "doi": f"https://doi.org/10.1/{i}", "display_name": f"Paper {i}",
+            "publication_year": 2025, "publication_date": "2025-10-01", "type": "article",
+            "primary_location": {"source": {"display_name": "Aquaculture"}, "landing_page_url": f"https://j.example/{i}"},
+            "authorships": [{"author": {"display_name": "A. Berg"}, "institutions": [{"display_name": "NTNU"}],
+                             "countries": ["NO"]},
+                            {"author": {"display_name": "S. Ali"}, "institutions": [{"display_name": "UAEU"}],
+                             "countries": ["AE"]}],
+            "topics": [{"display_name": "Fish farming"}], "cited_by_count": i,
+            "open_access": {"is_oa": True, "oa_url": None}}
+
+
+WFS_CAPABILITIES = b"""<?xml version="1.0"?>
+<WFS_Capabilities xmlns="http://www.opengis.net/wfs" version="1.0.0"><FeatureTypeList>
+  <FeatureType><Name>emodnet:finfish</Name><Title>Finfish aquaculture</Title></FeatureType>
+  <FeatureType><Name>emodnet:shellfish</Name><Title>Shellfish production</Title></FeatureType>
+  <FeatureType><Name>emodnet:windfarms</Name><Title>Wind farms</Title></FeatureType>
+</FeatureTypeList></WFS_Capabilities>"""
+
+WFS_FEATURES = {
+    "emodnet:finfish": [
+        {"id": f"finfish.{i}", "geometry": {"type": "Point", "coordinates": [5.0 + i, 60.0]},
+         "properties": {"name": f"Site {i}", "country": "NO", "species": "Salmo salar"}} for i in range(3)],
+    "emodnet:shellfish": [
+        {"id": "shellfish.1", "geometry": {"type": "Polygon", "coordinates": [[[0, 40], [2, 40], [2, 42], [0, 42]]]},
+         "properties": {"COUNTRY": "ES"}}],
+}
+
+
 class MockAPI(BaseHTTPRequestHandler):
     hits: dict = {}
     last_headers: dict = {}
@@ -69,6 +131,13 @@ class MockAPI(BaseHTTPRequestHandler):
                 return self._send(400, {"error": {"code": 400, "message": "bad format"}})
             return self._send(200, JSONSTAT)
         self._send(404, {"error": "not found"})
+
+    def _send_raw(self, status, data, ctype):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -143,6 +212,52 @@ class MockAPI(BaseHTTPRequestHandler):
             return self._send(200, {"year": year, "week": week, "localities": [
                 {"localityNo": 12345, "name": "Testvika", "avgAdultFemaleLice": 0.21}]})
 
+        if u.path == "/fao/Aquaculture_2026.1.0.zip":
+            return self._send_raw(200, fao_zip_bytes(), "application/zip")
+
+        if u.path == "/eurostat":  # one country per request; LU has no data
+            geo = q["geo"]
+            if geo == "LU":
+                return self._send(400, {"error": {"status": "400", "label": "No data"}})
+            if geo == "ES":
+                return self._send(200, {**eurostat_cube("ES"), "value": {}})
+            return self._send(200, eurostat_cube(geo))
+
+        if u.path == "/openalex":
+            cursor = q.get("cursor")
+            if cursor == "*":
+                return self._send(200, {"meta": {"count": 3, "next_cursor": "c2"}, "results": [
+                    openalex_work(1), openalex_work(2)]})
+            if cursor == "c2":
+                return self._send(200, {"meta": {"count": 3, "next_cursor": None}, "results": [openalex_work(3)]})
+            return self._send(400, {"error": "bad cursor"})
+
+        if u.path == "/zenodo":
+            page = int(q["page"])
+            hits = [{"id": i, "doi": f"10.5281/zenodo.{i}",
+                     "metadata": {"title": f"Dataset {i}", "publication_date": "2025-06-01",
+                                  "creators": [{"name": "Hansen, K."}], "keywords": ["aquaculture", "salmon"],
+                                  "resource_type": {"title": "Dataset"}, "license": {"id": "cc-by-4.0"}},
+                     "links": {"self_html": f"https://zenodo.org/records/{i}"}}
+                    for i in range(1, 4)][(page - 1) * 2: page * 2]
+            return self._send(200, {"hits": {"total": 3, "hits": hits}})
+
+        if u.path == "/gdelt":
+            if q.get("mode") != "artlist" or q.get("format") != "json":
+                return self._send_raw(200, b"Invalid query", "text/plain")
+            return self._send(200, {"articles": [
+                {"url": "https://news.example/a", "title": "New salmon farm approved", "seendate": "20251101T080000Z",
+                 "domain": "news.example", "language": "English", "sourcecountry": "Norway"},
+                {"url": "https://news.example/b", "title": "Oyster prices rise", "seendate": "20251102T080000Z",
+                 "domain": "news.example", "language": "English", "sourcecountry": "France"}]})
+
+        if u.path == "/wfs":
+            if q.get("request") == "GetCapabilities":
+                return self._send_raw(200, WFS_CAPABILITIES, "application/xml")
+            layer, start, n = q["typeName"], int(q["startIndex"]), int(q["maxFeatures"])
+            feats = WFS_FEATURES.get(layer, [])[start:start + n]
+            return self._send(200, {"type": "FeatureCollection", "features": feats})
+
         if u.path == "/comtrade-error":
             return self._send(200, {"data": [], "error": "invalid parameter"})
 
@@ -198,10 +313,15 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(len(rows), 8)
         self.assertEqual(rows[1], {"VareGrupper2": "01", "VareGrupper2_label": "Fresh salmon",
                                    "ContentsCode": "Vekt", "ContentsCode_label": "Weight (tonnes)",
-                                   "Tid": "2025U02", "Tid_label": "2025U02", "value": 21000})
+                                   "Tid": "2025U02", "Tid_label": "2025U02", "value": 21000,
+                                   "cell_key": "VareGrupper2=01|ContentsCode=Vekt|Tid=2025U02"})
         self.assertEqual(rows[7]["value"], 71.0)
-        sparse = {**JSONSTAT, "value": {"0": 5}}
-        self.assertEqual([r["value"] for r in aq.jsonstat_to_records(sparse)][:2], [5, None])
+        # sparse cube: only listed cells come back, in order, at the right coordinates
+        sparse = aq.jsonstat_to_records({**JSONSTAT, "value": {"7": 9.5, "0": 5}})
+        self.assertEqual([(r["VareGrupper2"], r["ContentsCode"], r["Tid"], r["value"]) for r in sparse],
+                         [("01", "Vekt", "2025U01", 5), ("02", "Kilopris", "2025U02", 9.5)])
+        dense_with_gaps = aq.jsonstat_to_records({**JSONSTAT, "value": [1, None, None, None, None, None, None, 2]})
+        self.assertEqual([r["value"] for r in dense_with_gaps], [1, 2])
 
     def test_iso_weeks(self):
         self.assertEqual(aq.parse_iso_week("2025-W07"), (2025, 7))
@@ -337,6 +457,89 @@ class ScraperTests(unittest.TestCase):
     def test_comtrade_error_string(self):
         cfg = self.preset("--source", "comtrade", "--url", self.base + "/comtrade-error", "--years", "2023")
         self.assertEqual(self.run_scrape(cfg).pages_failed, 1)
+
+    def test_fao_zip(self):
+        cfg = self.preset("--source", "fao_aquaculture", "--url", self.base + "/fao/Aquaculture_2026.1.0.zip")
+        res = self.run_scrape(cfg)
+        self.assertEqual(res.pages_failed, 0)
+        self.assertEqual(len(res.records), 3)            # duplicate row removed
+        self.assertEqual(res.duplicates, 1)
+        nor = res.records[0]
+        self.assertEqual((nor["country"], nor["country_iso3"], nor["species"], nor["scientific_name"]),
+                         ("Norway", "NOR", "Atlantic salmon", "Salmo salar"))
+        self.assertEqual((nor["area"], nor["environment"], nor["year"], nor["value"]),
+                         ("Atlantic, Northeast", "Marine", "2023", "1500000"))
+        self.assertEqual(res.records[1]["species_group"], "Miscellaneous coastal fishes")
+        self.assertEqual(res.records[2]["measure"], "V_USD_1000")
+        self.assertTrue(nor["source_url"].endswith("Aquaculture_2026.1.0.zip"))
+
+    def test_fao_candidate_urls(self):
+        import bulk_sources
+        urls = bulk_sources.fao_zip_candidates(aq.date(2026, 11, 4))
+        self.assertEqual(urls[0], "https://www.fao.org/fishery/static/Data/Aquaculture_2026.1.1.zip")
+        self.assertIn("https://www.fao.org/fishery/static/Data/Aquaculture_2025.1.0.zip", urls)
+
+    def test_fao_missing_zip_reported(self):
+        cfg = self.preset("--source", "fao_aquaculture", "--url", self.base + "/fao/missing.zip")
+        res = self.run_scrape(cfg)
+        self.assertEqual((res.records, res.pages_failed), ([], 1))
+
+    def test_eurostat_one_request_per_country(self):
+        cfg = self.preset("--source", "eurostat", "--url", self.base + "/eurostat", "--geo", "NO,LU,ES,IS")
+        res = self.run_scrape(cfg)
+        self.assertEqual(MockAPI.hits["/eurostat"], 4)
+        self.assertEqual(res.pages_failed, 1)              # LU failed; the run carried on
+        self.assertEqual(len(res.records), 6)              # 3 filled cells each for NO and IS
+        first = res.records[0]
+        self.assertEqual((first["geo"], first["species"], first["year"], first["value"]),
+                         ("NO", "Atlantic salmon", "2022", 100.0))
+        self.assertEqual(first["cell_key"], "species=SAL|unit=TLW|geo=NO|time=2022")
+        self.assertIn("geo=IS", res.records[-1]["source_url"])
+
+    def test_openalex_cursor_from_response(self):
+        cfg = self.preset("--source", "openalex", "--url", self.base + "/openalex", "--contact", "me@example.org")
+        self.assertEqual(cfg.params["mailto"], "me@example.org")
+        res = self.run_scrape(cfg)
+        self.assertEqual(res.pages_failed, 0)
+        self.assertEqual([r["title"] for r in res.records], ["Paper 1", "Paper 2", "Paper 3"])
+        r = res.records[0]
+        self.assertEqual(r["authors"], "A. Berg; S. Ali")
+        self.assertEqual(r["countries"], "NO; AE")
+        self.assertEqual(r["record_url"], "https://doi.org/10.1/1")
+        self.assertIn("cursor=c2", res.records[2]["source_url"])
+
+    def test_zenodo(self):
+        cfg = self.preset("--source", "zenodo", "--url", self.base + "/zenodo", "--page-size", "2")
+        res = self.run_scrape(cfg)
+        self.assertEqual(len(res.records), 3)
+        self.assertEqual(res.records[0]["keywords"], "aquaculture; salmon")
+        self.assertEqual(res.records[0]["record_url"], "https://zenodo.org/records/1")
+
+    def test_gdelt(self):
+        cfg = self.preset("--source", "gdelt", "--url", self.base + "/gdelt", "--timespan", "8d")
+        self.assertEqual(cfg.params["timespan"], "8d")
+        res = self.run_scrape(cfg)
+        self.assertEqual([r["source_country"] for r in res.records], ["Norway", "France"])
+        self.assertEqual(res.records[0]["record_url"], "https://news.example/a")
+
+    def test_emodnet_wfs_layers(self):
+        cfg = self.preset("--source", "emodnet", "--url", self.base + "/wfs", "--page-size", "2")
+        res = self.run_scrape(cfg)
+        self.assertEqual(res.pages_failed, 0)
+        self.assertEqual({r["layer"] for r in res.records}, {"emodnet:finfish", "emodnet:shellfish"})  # no wind farms
+        self.assertEqual(len(res.records), 4)               # 3 finfish over 2 pages + 1 shellfish
+        site = res.records[0]
+        self.assertEqual((site["name"], site["country"], site["latitude"], site["longitude"]),
+                         ("Site 0", "NO", 60.0, 5.0))
+        shell = res.records[-1]
+        self.assertEqual((shell["country"], shell["geometry_type"], shell["latitude"], shell["longitude"]),
+                         ("ES", "Polygon", 41.0, 1.0))
+        self.assertEqual(json.loads(shell["geometry"])["type"], "Polygon")   # full shape kept
+
+    def test_worldbank_many_indicators_need_source(self):
+        cfg = self.preset("--source", "worldbank", "--indicator", aq.WORLDBANK_FISHERY_INDICATORS, "--countries", "all")
+        self.assertEqual(cfg.params["source"], "2")
+        self.assertIn("/country/all/indicator/ER.FSH.AQUA.MT;ER.FSH.CAPT.MT;ER.FSH.PROD.MT", cfg.url)
 
     def test_end_to_end_cli_writes_csv_and_json(self):
         with tempfile.TemporaryDirectory() as out:
