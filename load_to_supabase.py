@@ -32,6 +32,7 @@ from typing import Any
 import requests
 
 import aquaculture_scraper as aq
+import species_sources
 from fingerprint import row_fingerprint
 
 log = logging.getLogger("load_to_supabase")
@@ -88,8 +89,23 @@ TABLES: dict[str, tuple[list[str], list[str]]] = {
         ["url", "title", "seen_date", "domain", "language", "source_country", "image_url", "source", "source_url", "record_url", "reference_url", "retrieved_at"]),
 }
 
+# Species tables (species_sources.py): columns come from the same definitions the scraper uses
+SPECIES_KEYS: dict[str, list[str]] = {
+    "species_taxonomy": ["aphia_id"], "species_common_names": ["cell_key"],
+    "species_synonyms": ["aphia_id", "synonym_aphia_id"], "species_distribution": ["cell_key"],
+    "species_attributes": ["cell_key"], "species_gbif_summary": ["gbif_key"],
+    "species_occurrences": ["gbif_id"], "species_genomes": ["accession"],
+    "species_profile": ["spec_code"], "fishbase_records": ["fb_table", "row_key"],
+}
+for _spec in species_sources.SPECIES_SOURCES.values():
+    TABLES[_spec["table"]] = (SPECIES_KEYS[_spec["table"]],
+                              list(_spec["fields"]) + list(aq.PROVENANCE_COLUMNS))
+
 # Columns stored as jsonb: the scraper writes them as JSON text, the database wants objects
-JSONB_COLUMNS: dict[str, set[str]] = {"facilities_europe": {"properties", "geometry"}}
+JSONB_COLUMNS: dict[str, set[str]] = {
+    "facilities_europe": {"properties", "geometry"}, "species_attributes": {"details"},
+    "species_gbif_summary": {"countries"}, "species_profile": {"data"}, "fishbase_records": {"data"},
+}
 
 # Filled in by the database (never sent, so upserts never overwrite them)
 DATABASE_COLUMNS = {"first_seen_at"}

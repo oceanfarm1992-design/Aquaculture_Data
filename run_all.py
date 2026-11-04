@@ -46,14 +46,43 @@ JOBS: dict[str, tuple[list[str], str]] = {
                       "Aquaculture news from the last 2 days (GDELT; runs daily)"),
 }
 
+# Species data: one set of rows per species (species.txt + FAO's top 100). These change
+# slowly and take ~30 minutes, so the workflow builds them monthly (--group species).
+SPECIES_JOBS: dict[str, tuple[list[str], str]] = {
+    "species_taxonomy": (["--source", "worms_taxonomy"],
+                         "Accepted name, authority, classification, NCBI/FishBase/ITIS IDs (WoRMS)"),
+    "species_common_names": (["--source", "worms_common_names"],
+                             "Common names in many languages (WoRMS)"),
+    "species_synonyms": (["--source", "worms_synonyms"], "Synonyms and their status (WoRMS)"),
+    "species_distribution": (["--source", "worms_distribution"],
+                             "Where each species lives: native, introduced, invasive (WoRMS)"),
+    "species_attributes": (["--source", "worms_attributes"],
+                           "Traits such as IUCN category, body size, functional group (WoRMS)"),
+    "species_gbif_summary": (["--source", "gbif_species"],
+                             "IUCN Red List category and occurrence counts by country (GBIF)"),
+    "species_occurrences": (["--source", "gbif_occurrences"],
+                            "Recent georeferenced occurrence records, 300 per species (GBIF)"),
+    "species_genomes": (["--source", "ncbi_genomes"], "Sequenced genome assemblies (NCBI)"),
+    "species_profile": (["--source", "fishbase_profile"],
+                        "Biology: size, age, depth, habitat, trophic level, temperature, aquaculture use (FishBase)"),
+    "fishbase_records": (["--source", "fishbase_records"],
+                         "Growth, length-weight, maturity, spawning, fecundity, ecology, range (FishBase)"),
+}
+
+ALL_JOBS = {**JOBS, **SPECIES_JOBS}
+GROUPS = {"weekly": JOBS, "species": SPECIES_JOBS, "all": ALL_JOBS}
+
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(description="Build all aquaculture tables (Norway + UAE).")
+    p = argparse.ArgumentParser(description="Build the aquaculture tables.")
     p.add_argument("--contact", default=os.environ.get("AQUA_SCRAPER_CONTACT"),
                    help="email/URL put in the User-Agent (or set AQUA_SCRAPER_CONTACT)")
     p.add_argument("--out-dir", default="data", help="output folder (default: data)")
-    p.add_argument("--only", nargs="+", choices=sorted(JOBS), metavar="TABLE",
+    p.add_argument("--only", nargs="+", choices=sorted(ALL_JOBS), metavar="TABLE",
                    help="build only these tables")
+    p.add_argument("--group", choices=sorted(GROUPS), default="weekly",
+                   help="weekly: statistics, sites, research, news (default); species: per-species "
+                        "data; all: both")
     p.add_argument("--delay", type=float, default=1.5, help="seconds between requests")
     p.add_argument("--list", action="store_true", help="list the tables and exit")
     args = p.parse_args(argv)
@@ -63,8 +92,10 @@ def main(argv: list[str] | None = None) -> int:
     log = logging.getLogger("run_all")
 
     if args.list:
-        for table, (_, desc) in JOBS.items():
-            print(f"{table:30s} {desc}")
+        for group in ("weekly", "species"):
+            print(f"[{group}]")
+            for table, (_, desc) in GROUPS[group].items():
+                print(f"  {table:32s} {desc}")
         return 0
 
     common = ["--out-dir", args.out_dir, "--delay", str(args.delay)]
@@ -72,8 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         common += ["--contact", args.contact]
 
     results: dict[str, str] = {}
-    for table in args.only or JOBS:
-        job_args, desc = JOBS[table]
+    for table in args.only or GROUPS[args.group]:
+        job_args, desc = ALL_JOBS[table]
         log.info("=== %s — %s ===", table, desc)
         started = time.monotonic()
         try:

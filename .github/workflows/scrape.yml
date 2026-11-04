@@ -16,10 +16,11 @@ on:
   schedule:
     - cron: "17 3 * * 1"          # Mondays 03:17 UTC: every table, archived as a release
     - cron: "43 5 * * 0,2-6"      # Other days 05:43 UTC: news and research only
+    - cron: "29 2 1 * *"          # 1st of each month 02:29 UTC: species data (taxonomy, biology, ...)
   workflow_dispatch:
     inputs:
       tables:
-        description: "Tables to build, space separated (empty = all)"
+        description: "Tables to build, space separated; 'species' for all species tables (empty = weekly tables)"
         required: false
         default: ""
 
@@ -57,7 +58,9 @@ jobs:
           if [ "$SCHEDULE" = "43 5 * * 0,2-6" ]; then
             TABLES="news_articles research_publications"
           fi
-          if [ -n "$TABLES" ]; then
+          if [ "$SCHEDULE" = "29 2 1 * *" ] || [ "$TABLES" = "species" ]; then
+            python run_all.py --out-dir data --group species
+          elif [ -n "$TABLES" ]; then
             python run_all.py --out-dir data --only $TABLES
           else
             python run_all.py --out-dir data
