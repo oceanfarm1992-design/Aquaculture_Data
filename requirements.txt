@@ -1,7 +1,7 @@
 # Exact versions, so every run uses a tested set. Dependabot (.github/dependabot.yml)
 # opens a pull request when a newer version is released; the tests run on it, and
 # minor/patch updates merge automatically when they pass.
-pandas==3.1.0
+pandas==3.1.1
 requests==2.34.2
 urllib3==2.8.0
-pyarrow==26.0.0  # reads FishBase's Parquet files
+pyarrow==26.0.1  # reads FishBase's Parquet files
