@@ -104,6 +104,7 @@ WFS_FEATURES = {
 
 class MockAPI(BaseHTTPRequestHandler):
     hits: dict = {}
+    asked: dict = {}
     last_headers: dict = {}
 
     def log_message(self, *a):  # keep test output clean
@@ -218,6 +219,11 @@ class MockAPI(BaseHTTPRequestHandler):
 
         if u.path == "/eurostat":  # one country and year block per request; LU has no data
             geo, since, until = q["geo"], int(q["sinceTimePeriod"]), int(q["untilTimePeriod"])
+            ask = (geo, since)
+            MockAPI.asked[ask] = MockAPI.asked.get(ask, 0) + 1
+            if geo == "IS" and MockAPI.asked[ask] == 1:   # big request: prepared in the background
+                return self._send(413, {"error": [{"status": 413, "label": "ASYNCHRONOUS_RESPONSE. Your "
+                                                   "request will be treated asynchronously. Please try again later."}]})
             if geo == "LU":
                 return self._send(400, {"error": {"status": "400", "label": "No data"}})
             if geo == "ES" or not (since <= 2022 <= until or since <= 2023 <= until):
@@ -284,7 +290,7 @@ class ScraperTests(unittest.TestCase):
         cls.server.shutdown()
 
     def setUp(self):
-        MockAPI.hits = {}
+        MockAPI.hits, MockAPI.asked = {}, {}
 
     def run_scrape(self, cfg, max_pages=20, session=None):
         return aq.scrape(cfg, session or self.session, max_pages=max_pages, delay=0)
@@ -455,6 +461,34 @@ class ScraperTests(unittest.TestCase):
         cfg = self.preset("--source", "comtrade", "--url", self.base + "/comtrade-error", "--years", "2023")
         self.assertEqual(self.run_scrape(cfg).pages_failed, 1)
 
+    def test_fiskeridir_fields_from_live_record(self):
+        # shape of a real record, from the first live run's log
+        raw = {"siteId": 5, "siteNr": 10029, "name": "TUHOLMANE Ø", "placementType": "Offshore",
+               "waterType": "Salt", "firstClearanceTime": "1998-06-18T22:00:00Z", "latitude": 59.371233,
+               "longitude": 5.216333, "capacity": 2340.0, "tempCapacity": 2340.0, "capacityUnitType": "TN",
+               "placement": {"municipalityName": "KARMØY", "countyName": "ROGALAND",
+                             "prodAreaName": "Karmøy til Sotra", "prodAreaStatus": "RØD"},
+               "speciesType": None,
+               "speciesLimitations": [{"latinName": "Salmo salar", "enGbName": "Atlantic salmon", "faoAlpha3Code": "SAL"},
+                                      {"latinName": "Oncorhynchus mykiss", "enGbName": "Rainbow trout", "faoAlpha3Code": "TRR"}],
+               "connections": [{"licenseNr": "H-KM-0018", "status": "ACTIVE"},
+                               {"licenseNr": "R-R-0007", "status": "ACTIVE"}]}
+        row = aq.apply_field_map(raw, aq.FISKERIDIR_FIELDS)
+        self.assertEqual(row["species"], "Salmo salar; Oncorhynchus mykiss")
+        self.assertEqual(row["species_common_names"], "Atlantic salmon; Rainbow trout")
+        self.assertEqual(row["species_fao_codes"], "SAL; TRR")
+        self.assertEqual((row["production_area_status"], row["license_status"], row["license_numbers"]),
+                         ("RØD", "ACTIVE", "H-KM-0018; R-R-0007"))
+        self.assertEqual((row["temporary_capacity"], row["registered_date"]), (2340.0, "1998-06-18T22:00:00Z"))
+        self.assertFalse({"company", "org_numbers", "status"} & set(row))
+
+    def test_geometry_rounding(self):
+        import bulk_sources
+        g = {"type": "Polygon", "coordinates": [[[5.123456789012, 60.987654321098], [5.1, 61]]]}
+        self.assertEqual(bulk_sources.round_geometry(g)["coordinates"], [[[5.123457, 60.987654], [5.1, 61]]])
+        coll = {"type": "GeometryCollection", "geometries": [{"type": "Point", "coordinates": [1.00000049, 2.0]}]}
+        self.assertEqual(bulk_sources.round_geometry(coll)["geometries"][0]["coordinates"], [1.0, 2.0])
+
     def test_fao_zip(self):
         cfg = self.preset("--source", "fao_aquaculture", "--url", self.base + "/fao/Aquaculture_2026.1.0.zip")
         res = self.run_scrape(cfg)
@@ -487,9 +521,12 @@ class ScraperTests(unittest.TestCase):
 
     def test_eurostat_one_request_per_country_and_year_block(self):
         cfg = self.preset("--source", "eurostat", "--url", self.base + "/eurostat", "--geo", "NO,LU,ES,IS")
+        import bulk_sources
         blocks = len(aq.eurostat_periods())
-        res = self.run_scrape(cfg, max_pages=100)
-        self.assertEqual(MockAPI.hits["/eurostat"], 4 * blocks)
+        with mock.patch.object(bulk_sources, "EUROSTAT_ASYNC_WAIT", 0):
+            res = self.run_scrape(cfg, max_pages=100)
+        # every request once, plus Iceland's again: Eurostat prepared those in the background
+        self.assertEqual(MockAPI.hits["/eurostat"], 5 * blocks)
         self.assertEqual(res.pages_failed, blocks)          # LU failed in every block; the run carried on
         self.assertEqual(len(res.records), 6)              # 3 filled cells each for NO and IS
         first = res.records[0]
@@ -522,7 +559,7 @@ class ScraperTests(unittest.TestCase):
         self.assertEqual(res.pages_failed, 0)
         self.assertEqual(len(res.records), 1)
         self.assertEqual(MockAPI.hits["/gdelt-limited"], 2)
-        slept.assert_called_once_with(10.0)
+        slept.assert_called_once_with(30.0)
 
     def test_gdelt(self):
         cfg = self.preset("--source", "gdelt", "--url", self.base + "/gdelt", "--timespan", "8d")

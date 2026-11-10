@@ -49,12 +49,11 @@ Every table also has `first_seen_at`, set by the database when a row first arriv
 ## How the tables link
 
 ```
-companies_norway.org_number ──< facilities_norway.org_numbers   (a site lists its licence holders' org numbers)
-
+facilities_norway.species_fao_codes ──> fao_aquaculture_production.species_code   (split on '; ')
 production_by_country.country_iso3 ── trade_fish_by_country.reporter_iso3   (NOR, ARE)
 ```
 
-`facilities_norway.org_numbers` can hold several org numbers joined with `; `. Split on `; ` before joining to `companies_norway`.
+The Norwegian register's site records carry licence numbers but no company IDs, so `facilities_norway` and `companies_norway` don't join directly.
 
 ## Tables
 
@@ -66,15 +65,15 @@ One row per registered site. Categories covered: 1 (identity), 2 (species), 8 (l
 | `facility_id` | Register's internal site ID |
 | `site_number` | Official site number |
 | `facility_name` | Site name |
-| `species` | Permitted species (`; ` separated) |
+| `species` | Scientific names of the species the site may farm (`; ` separated) |
+| `species_common_names`, `species_fao_codes` | Their English names and FAO 3-alpha codes |
 | `latitude`, `longitude` | Position, decimal degrees |
-| `capacity`, `capacity_unit` | Permitted capacity (MTB) and unit |
-| `company` | Licence holder name(s) |
-| `org_numbers` | Licence holders' org numbers (key to `companies_norway`) |
-| `license_numbers` | Licence numbers linked to the site |
+| `capacity`, `capacity_unit`, `temporary_capacity` | Permitted capacity (MTB), unit, temporary capacity |
+| `license_numbers`, `license_status` | Licences connected to the site and their status |
 | `water_type`, `placement_type` | Salt/fresh water; sea/land |
 | `municipality`, `county`, `production_area` | Location |
-| `status`, `registered_date` | Site status and clearance date |
+| `production_area_status` | The production area's traffic light: `GRØNN` (green), `GUL` (yellow), `RØD` (red) |
+| `registered_date` | First clearance date |
 
 ### `companies_norway` — Brønnøysund Register Centre
 One row per aquaculture company, selected by industry code (NACE 03.211, 03.212, 03.221, 03.222). Category covered: 14 (company).

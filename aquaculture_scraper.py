@@ -177,22 +177,22 @@ FISKERIDIR_FIELDS: FieldMap = {
     "facility_id": ["siteId", "id"],
     "site_number": ["siteNr", "siteNumber"],
     "facility_name": ["name", "siteName"],
-    "species": ["species[*].name", "species[*]", "speciesType", "connections[*].species[*].name"],
+    "species": ["speciesLimitations[*].latinName", "speciesType"],
+    "species_common_names": ["speciesLimitations[*].enGbName"],
+    "species_fao_codes": ["speciesLimitations[*].faoAlpha3Code"],
     "latitude": ["latitude", "lat", "coordinates.latitude", "position.latitude"],
     "longitude": ["longitude", "lon", "lng", "coordinates.longitude", "position.longitude"],
     "capacity": ["capacity", "maxCapacity", "biomassCapacity"],
     "capacity_unit": ["capacityUnitType", "capacityUnit"],
-    "company": ["connections[*].legalEntityName", "connections[*].ownerName",
-                "connections[*].licenseHolder.name", "ownerName", "companyName"],
-    "org_numbers": ["connections[*].legalEntityNr", "connections[*].orgNr",
-                    "connections[*].organizationNumber", "connections[*].licenseHolder.orgNr"],
+    "temporary_capacity": ["tempCapacity"],
     "license_numbers": ["connections[*].licenseNr", "connections[*].licenseNumber"],
     "water_type": ["waterType", "waterEnvironment"],
     "placement_type": ["placementType", "placement.placementType"],
     "municipality": ["placement.municipalityName", "municipalityName"],
     "county": ["placement.countyName", "countyName"],
     "production_area": ["placement.prodAreaName", "productionAreaName", "prodAreaName"],
-    "status": ["status", "siteStatus"],
+    "production_area_status": ["placement.prodAreaStatus"],  # traffic light: GRØNN / GUL / RØD
+    "license_status": ["connections[*].status"],
     "registered_date": ["firstClearanceTime", "registeredDate", "clearanceDate"],
 }
 
@@ -423,10 +423,11 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
         geo = args.geo.split(",") if args.geo else EUROSTAT_GEO
         requests_ = [{"geo": g, "sinceTimePeriod": str(a), "untilTimePeriod": str(b)}
                      for g in geo for a, b in eurostat_periods()]
+        import bulk_sources
         cfg = SourceConfig(
             name="Eurostat fish_aq2a (aquaculture production)",
             url="https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/fish_aq2a",
-            pagination="values", iterate_values=requests_, parser="jsonstat",
+            pagination="none", iterate_values=requests_, custom_fetch=bulk_sources.fetch_eurostat,
             params={"format": "JSON", "lang": "EN"}, field_map=EUROSTAT_FIELDS, id_field="cell_key",
             max_consecutive_failures=30, table="eurostat_aquaculture_production",
             reference_url="https://ec.europa.eu/eurostat/databrowser/view/fish_aq2a/default/table")
@@ -464,7 +465,8 @@ def build_source(args: argparse.Namespace) -> SourceConfig:
             params={"query": query, "mode": "artlist", "format": "json", "maxrecords": "250",
                     "timespan": args.timespan, "sort": "DateDesc"},
             field_map=GDELT_FIELDS, id_field="url", table="news_articles",
-            retry_on_429=False, rate_limit_wait=10.0, rate_limit_retries=3,  # max 1 request / 5 s
+            # max 1 request / 5 s, and shared CI addresses often hit the limit: wait longer
+            retry_on_429=False, rate_limit_wait=30.0, rate_limit_retries=4,
             reference_url="https://www.gdeltproject.org/", record_url=lambda r: r.get("url"))
     elif s == "comtrade":
         reporters = args.reporters or ",".join(COUNTRY_CODES.values())

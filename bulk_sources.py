@@ -184,6 +184,28 @@ def _coords(geometry: Any) -> list[tuple[float, float]]:
     return out
 
 
+COORD_DECIMALS = 6  # about 10 cm: far finer than any farm boundary, a fraction of the size
+
+
+def round_geometry(geometry: Any, decimals: int = COORD_DECIMALS) -> Any:
+    """GeoJSON geometry with every coordinate rounded. Map services often send 15 digits per
+    coordinate; shapes with thousands of points then dominate storage and upload size."""
+    def walk(c):
+        if isinstance(c, float):
+            return round(c, decimals)
+        if isinstance(c, list):
+            return [walk(x) for x in c]
+        return c
+    if not isinstance(geometry, dict):
+        return geometry
+    out = dict(geometry)
+    if "coordinates" in out:
+        out["coordinates"] = walk(out["coordinates"])
+    if isinstance(out.get("geometries"), list):
+        out["geometries"] = [round_geometry(g, decimals) for g in out["geometries"]]
+    return out
+
+
 def centre(geometry: Any) -> tuple[float | None, float | None]:
     """(lat, lon): the point itself, or the mean of a shape's vertices (a rough centre)."""
     pts = _coords(geometry)
@@ -246,8 +268,10 @@ def fetch_wfs_layers(session: requests.Session, cfg: "aq.SourceConfig", delay: f
             for i, f in enumerate(features):
                 if not isinstance(f, dict):
                     continue
-                geometry = f.get("geometry")
+                geometry = round_geometry(f.get("geometry"))
                 lat, lon = centre(geometry)
+                lat = round(lat, COORD_DECIMALS) if lat is not None else None
+                lon = round(lon, COORD_DECIMALS) if lon is not None else None
                 pairs.append(({
                     "layer": name, "layer_title": title or None,
                     "feature_id": str(f.get("id") or f"{name}.{start + i}"),
@@ -259,4 +283,55 @@ def fetch_wfs_layers(session: requests.Session, cfg: "aq.SourceConfig", delay: f
             if len(features) < cfg.page_size:
                 break
             start += len(features)
+    return pairs, failed
+
+
+# --------------------------------------------------------------------------------------
+# Eurostat (asynchronous extractions)
+# --------------------------------------------------------------------------------------
+EUROSTAT_ASYNC_WAIT = 60.0  # seconds between rounds of asking again
+EUROSTAT_ASYNC_ROUNDS = 6
+
+
+def fetch_eurostat(session: requests.Session, cfg: "aq.SourceConfig", delay: float):
+    """One request per country and year block (cfg.iterate_values). Eurostat answers a large
+    request with 413 "ASYNCHRONOUS_RESPONSE": it prepares the data and serves it when the
+    same request is repeated later. So every request is sent once, then the queued ones are
+    asked for again each minute, for up to EUROSTAT_ASYNC_ROUNDS rounds."""
+    import time
+
+    queue = list(cfg.iterate_values)
+    pairs: list[tuple[dict, str]] = []
+    failed = 0
+    for round_no in range(EUROSTAT_ASYNC_ROUNDS + 1):
+        pending = []
+        for request in queue:
+            aq.polite_sleep(delay)
+            label = ", ".join(f"{k} {v}" for k, v in request.items())
+            try:
+                body, url = aq.fetch_json(session, cfg.url, {**cfg.params, **request})
+            except aq.FetchError as exc:
+                if exc.status == 413 and "ASYNCHRONOUS" in str(exc).upper():
+                    pending.append(request)
+                    continue
+                failed += 1
+                log.error("Eurostat %s failed: %s", label, exc)
+                continue
+            records = aq.jsonstat_to_records(body) or []
+            pairs += [(r, url) for r in records]
+            log.info("Eurostat %s: %d values", label, len(records))
+        if not pending:
+            break
+        if round_no == EUROSTAT_ASYNC_ROUNDS:
+            failed += len(pending)
+            log.error("Eurostat still preparing %d requests after %d rounds; they will be "
+                      "fetched on the next run.", len(pending), EUROSTAT_ASYNC_ROUNDS)
+            break
+        log.info("Eurostat is preparing %d requests in the background; asking again in %.0fs "
+                 "(round %d of %d).", len(pending), EUROSTAT_ASYNC_WAIT, round_no + 1,
+                 EUROSTAT_ASYNC_ROUNDS)
+        time.sleep(EUROSTAT_ASYNC_WAIT)
+        queue = pending
+    if not pairs and failed:
+        raise aq.FetchError(f"no Eurostat data: {failed} requests failed or never became ready")
     return pairs, failed

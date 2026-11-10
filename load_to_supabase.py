@@ -26,10 +26,13 @@ import logging
 import math
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 import aquaculture_scraper as aq
 import species_sources
@@ -37,16 +40,22 @@ from fingerprint import row_fingerprint
 
 log = logging.getLogger("load_to_supabase")
 
-BATCH_SIZE = 500
+BATCH_SIZE = 500          # rows per request at most ...
+BATCH_BYTES = 1_000_000   # ... and about 1 MB of JSON at most
+BATCH_PAUSE = 0.2         # seconds between requests: a free-tier database needs breathing room
+WRITE_TIMEOUT = (10, 120)  # (connect, read) seconds; big upserts can take a while
+RETRY_STATUSES = {429, 500, 502, 503, 504, 520, 521, 522, 523, 524}  # busy / down / Cloudflare
+RETRY_WAITS = (10, 30, 60, 120, 240)  # seconds to wait before each retry of a batch
 
 # table -> (primary-key columns, all columns). Must match the migration (checked by tests).
 TABLES: dict[str, tuple[list[str], list[str]]] = {
     "facilities_norway": (
         ["site_number"],
         ["site_number", "facility_id", "facility_name", "species", "latitude", "longitude",
-         "capacity", "capacity_unit", "company", "org_numbers", "license_numbers", "water_type",
-         "placement_type", "municipality", "county", "production_area", "status",
-         "registered_date", "source", "retrieved_at", "source_url", "record_url", "reference_url"]),
+         "capacity", "capacity_unit", "license_numbers", "water_type", "placement_type",
+         "municipality", "county", "production_area", "registered_date", "source", "retrieved_at",
+         "source_url", "record_url", "reference_url", "species_common_names", "species_fao_codes",
+         "temporary_capacity", "production_area_status", "license_status"]),
     "companies_norway": (
         ["org_number"],
         ["org_number", "company_name", "legal_form", "nace_code", "nace_description", "employees",
@@ -186,11 +195,21 @@ def existing_hashes(session: requests.Session, base_url: str, api_key: str,
     hashes: dict[tuple[str, ...], str | None] = {}
     offset = 0
     while True:
-        try:
-            resp = session.get(url, params={**params, "offset": offset}, headers=auth_headers(api_key),
-                               timeout=aq.DEFAULT_TIMEOUT)
-        except requests.RequestException as exc:
-            raise LoadError(f"could not read existing rows: {exc}") from exc
+        resp = None
+        for attempt, wait in enumerate((*RETRY_WAITS, None)):
+            try:
+                resp = session.get(url, params={**params, "offset": offset},
+                                   headers=auth_headers(api_key), timeout=WRITE_TIMEOUT)
+                if resp.status_code not in RETRY_STATUSES:
+                    break
+                problem = f"HTTP {resp.status_code}"
+            except requests.RequestException as exc:
+                resp, problem = None, f"{type(exc).__name__}: {exc}"
+            if wait is None:
+                raise LoadError(f"could not read existing rows ({problem})")
+            log.warning("%s: database busy or unreachable while reading (%s); waiting %ds.",
+                        table, problem, wait)
+            time.sleep(wait)
         if resp.status_code >= 300:
             if HASH_COLUMN in resp.text and ("42703" in resp.text or "does not exist" in resp.text):
                 return None
@@ -222,31 +241,92 @@ def only_new_or_changed(table: str, rows: list[dict],
     return send, new, changed, len(rows) - len(send)
 
 
-def upsert(session: requests.Session, base_url: str, api_key: str, table: str,
-           rows: list[dict], batch_size: int = BATCH_SIZE) -> int:
+def _batches(rows: list[dict], max_rows: int, max_bytes: int) -> list[list[dict]]:
+    """Split rows into batches of at most max_rows rows and roughly max_bytes of JSON, so a
+    table of big rows (e.g. map shapes) is sent in small requests and a small-row table in
+    large ones."""
+    batches, batch, size = [], [], 2
+    for row in rows:
+        row_size = len(json.dumps(row, ensure_ascii=False, default=str).encode("utf-8")) + 1
+        if batch and (len(batch) >= max_rows or size + row_size > max_bytes):
+            batches.append(batch)
+            batch, size = [], 2
+        batch.append(row)
+        size += row_size
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+class _Retryable(Exception):
+    """The database is busy or unreachable; worth waiting and trying again."""
+
+
+def _post(session: requests.Session, url: str, params: dict, headers: dict, batch: list[dict]) -> None:
+    try:
+        resp = session.post(url, params=params, headers=headers, timeout=WRITE_TIMEOUT,
+                            data=json.dumps(batch, ensure_ascii=False, default=str).encode("utf-8"))
+    except requests.RequestException as exc:  # timeout, connection reset, ...
+        raise _Retryable(f"{type(exc).__name__}: {exc}") from exc
+    if resp.status_code in RETRY_STATUSES:
+        raise _Retryable(f"HTTP {resp.status_code}: {resp.text[:160]!r}")
+    if resp.status_code >= 300:
+        hint = ""
+        if resp.status_code == 404 or "PGRST205" in resp.text or "does not exist" in resp.text:
+            hint = " (has the latest migration been applied to this project?)"
+        elif resp.status_code in (401, 403):
+            hint = " (check the key: it must be the secret / service_role key, not the publishable key)"
+        raise LoadError(f"HTTP {resp.status_code}: {resp.text[:300]!r}{hint}")
+
+
+def upsert(session: requests.Session, base_url: str, api_key: str, table: str, rows: list[dict],
+           batch_size: int = BATCH_SIZE, max_bytes: int = BATCH_BYTES) -> int:
+    """Send rows in size-capped batches. If the database is busy or briefly down, wait and
+    retry with half the batch; give up on a batch after len(RETRY_WAITS) tries."""
     key_cols, _ = TABLES[table]
     url = f"{base_url}/rest/v1/{table}"
+    params = {"on_conflict": ",".join(key_cols)}
     headers = {**auth_headers(api_key), "Content-Type": "application/json",
                "Prefer": "resolution=merge-duplicates,return=minimal"}
-    sent = 0
-    for start in range(0, len(rows), batch_size):
-        batch = rows[start:start + batch_size]
+    queue = _batches(rows, batch_size, max_bytes)
+    sent, attempts = 0, 0
+    while queue:
+        batch = queue.pop(0)
         try:
-            resp = session.post(url, params={"on_conflict": ",".join(key_cols)}, headers=headers,
-                                data=json.dumps(batch, ensure_ascii=False).encode("utf-8"),
-                                timeout=aq.DEFAULT_TIMEOUT)
-        except requests.RequestException as exc:
-            raise LoadError(f"network error after {sent} rows: {exc}") from exc
-        if resp.status_code >= 300:
-            hint = ""
-            if resp.status_code == 404 or "PGRST205" in resp.text or "does not exist" in resp.text:
-                hint = " (has the migration been applied to this project?)"
-            elif resp.status_code in (401, 403):
-                hint = " (check the key: it must be the service_role / secret key, not the anon key)"
-            raise LoadError(f"HTTP {resp.status_code} after {sent} rows: {resp.text[:300]!r}{hint}")
+            _post(session, url, params, headers, batch)
+        except _Retryable as exc:
+            if attempts >= len(RETRY_WAITS):
+                raise LoadError(f"database still not responding after {attempts} retries "
+                                f"({sent} of {len(rows)} rows sent): {exc}") from exc
+            wait = RETRY_WAITS[attempts]
+            attempts += 1
+            if len(batch) > 1:  # smaller requests are easier on a struggling database
+                half = len(batch) // 2
+                queue[:0] = [batch[:half], batch[half:]]
+            else:
+                queue.insert(0, batch)
+            log.warning("%s: database busy or unreachable (%s); waiting %ds, then retrying with %d rows.",
+                        table, exc, wait, len(queue[0]))
+            time.sleep(wait)
+            continue
+        attempts = 0
         sent += len(batch)
         log.info("%s: upserted %d/%d rows", table, sent, len(rows))
+        if queue and BATCH_PAUSE:
+            time.sleep(BATCH_PAUSE)
     return sent
+
+
+def make_session() -> requests.Session:
+    """HTTP session for the database. Retries are handled by upsert() (with smaller batches),
+    so only connection set-up is retried here: re-sending a big batch on a read timeout
+    would just repeat the load that caused it."""
+    session = requests.Session()
+    retry = Retry(total=3, connect=3, read=0, status=0, backoff_factor=2, allowed_methods=None)
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+    session.headers["User-Agent"] = f"AquacultureDataBot/{aq.__version__} (Supabase loader)"
+    return session
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -269,7 +349,7 @@ def main(argv: list[str] | None = None) -> int:
         log.error("SUPABASE_URL should look like https://<project-ref>.supabase.co")
         return 2
 
-    session = aq.create_session(f"AquacultureDataBot/{aq.__version__} (Supabase loader)")
+    session = make_session()
     results: dict[str, str] = {}
     for table in args.only or TABLES:
         path = Path(args.data_dir) / f"{table}.json"

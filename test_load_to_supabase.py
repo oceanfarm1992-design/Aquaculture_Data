@@ -40,6 +40,9 @@ def migration_tables() -> dict[str, tuple[list[str], list[str]]]:
             tables[name] = (pk, columns)
         for name, body in re.findall(r"alter table public\.(\w+)\s+(add column.*?);", sql, re.S):
             tables[name][1].extend(re.findall(r"add column if not exists (\w+)", body))
+        for name, body in re.findall(r"alter table public\.(\w+)\s+(drop column.*?);", sql, re.S):
+            dropped = set(re.findall(r"drop column if exists (\w+)", body))
+            tables[name] = (tables[name][0], [c for c in tables[name][1] if c not in dropped])
         for name in re.findall(r"drop table if exists public\.(\w+)", sql):
             tables.pop(name, None)
     return tables
@@ -47,6 +50,7 @@ def migration_tables() -> dict[str, tuple[list[str], list[str]]]:
 
 class MockSupabase(BaseHTTPRequestHandler):
     received: dict = {}       # table -> every row POSTed
+    fail_next: list = []      # statuses to answer the next POSTs with (e.g. 503 = database busy)
     store: dict = {}          # table -> {key: row}, like the real table
     requests: list = []       # POSTs
     reads: list = []          # GETs
@@ -65,6 +69,9 @@ class MockSupabase(BaseHTTPRequestHandler):
         table = u.path.rsplit("/", 1)[-1]
         if table == "missing_table":
             return self._send(404, {"code": "PGRST205", "message": "Could not find the table"})
+        if MockSupabase.fail_next:
+            status = MockSupabase.fail_next.pop(0)
+            return self._send(status, {"title": f"Error {status}", "message": "database busy"})
         MockSupabase.received.setdefault(table, []).extend(body)
         key_cols = lts.TABLES[table][0]
         for row in body:
@@ -107,6 +114,11 @@ class LoaderTests(unittest.TestCase):
     def setUp(self):
         MockSupabase.received, MockSupabase.requests, MockSupabase.reads = {}, [], []
         MockSupabase.store, MockSupabase.no_hash_tables = {}, set()
+        MockSupabase.fail_next = []
+        for name, value in (("RETRY_WAITS", (0, 0, 0)), ("BATCH_PAUSE", 0)):   # no real waiting in tests
+            patcher = mock.patch.object(lts, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.data = Path(self.tmp.name)
         self.env = mock.patch.dict(os.environ, {"SUPABASE_URL": self.url + "/",
@@ -166,6 +178,41 @@ class LoaderTests(unittest.TestCase):
             lts.main(["--data-dir", str(self.data), "--only", "companies_norway"])
         self.assertEqual([r["offset"] for r in MockSupabase.reads], [0, 2, 3])
         self.assertEqual(len(MockSupabase.received["companies_norway"]), 3)   # still nothing re-sent
+
+    def test_batches_are_capped_by_size(self):
+        small = [{"n": i, "text": "x"} for i in range(10)]
+        self.assertEqual([len(b) for b in lts._batches(small, 4, 10_000)], [4, 4, 2])
+        big = [{"n": i, "geometry": "x" * 400} for i in range(10)]          # ~420 bytes each
+        self.assertEqual([len(b) for b in lts._batches(big, 500, 1_000)], [2, 2, 2, 2, 2])
+
+    def test_busy_database_is_waited_out_with_smaller_batches(self):
+        self.write("companies_norway", self.companies(1))
+        MockSupabase.no_hash_tables = {"companies_norway"}
+        MockSupabase.fail_next = [522, 503]          # Cloudflare timeout, then busy, then fine
+        with mock.patch.object(lts.time, "sleep") as slept, self.assertLogs("load_to_supabase", "WARNING"):
+            code = lts.main(["--data-dir", str(self.data), "--only", "companies_norway"])
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(r["org_number"] for r in MockSupabase.received["companies_norway"]), ["1", "2", "3"])
+        self.assertEqual([r["n"] for r in MockSupabase.requests], [3, 1, 1, 2])   # split after each failure
+        self.assertEqual(slept.call_count, 2)
+
+    def test_database_that_stays_down_fails_the_table_cleanly(self):
+        self.write("companies_norway", self.companies(1))
+        MockSupabase.no_hash_tables = {"companies_norway"}
+        MockSupabase.fail_next = [521] * 10
+        with mock.patch.object(lts.time, "sleep"), self.assertLogs("load_to_supabase", "ERROR") as logs:
+            code = lts.main(["--data-dir", str(self.data), "--only", "companies_norway"])
+        self.assertEqual(code, 1)
+        self.assertTrue(any("still not responding after 3 retries" in m for m in logs.output))
+
+    def test_data_errors_are_not_retried(self):
+        self.write("missing_table", [{"x": 1}])
+        lts.TABLES["missing_table"] = (["x"], ["x"])
+        self.addCleanup(lts.TABLES.pop, "missing_table")
+        with mock.patch.object(lts.time, "sleep") as slept:
+            with self.assertRaises(lts.LoadError):
+                lts.upsert(lts.make_session(), self.url, "sb_secret_test", "missing_table", [{"x": 1}])
+        slept.assert_not_called()
 
     def test_table_without_row_hash_column_still_loads(self):
         MockSupabase.no_hash_tables = {"companies_norway"}

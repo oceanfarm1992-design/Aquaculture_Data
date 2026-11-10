@@ -128,6 +128,8 @@ Path syntax: `a.b` (nested key), `a[0].b` (list item), `a[*].b` (every item, joi
 - **Fault-tolerant:** bad records are skipped and logged; failed pages are skipped (it stops after 3 in a row); a loop guard stops if the API ignores pagination; Ctrl+C saves partial results; files are written atomically.
 - **Supports:** page, offset, range, cursor, ArcGIS, week-by-week and one-request-per-value pagination; GET and POST; JSON-stat 2.0 (statistics offices).
 
+The loader is gentle with the database: requests are capped at 500 rows and about 1 MB, with a short pause between them. If Supabase is busy or briefly unreachable (timeouts, HTTP 5xx, Cloudflare 52x), it waits 10 s, 30 s, 1, 2 and 4 minutes, retrying with smaller batches, before giving up on that table.
+
 Exit codes: `0` success, `1` partial (some pages failed or interrupted), `2` no data or blocked by robots.txt.
 
 ## Automated runs (GitHub Actions)
@@ -200,7 +202,7 @@ python -m unittest discover -v -p "test_*.py"
 
 The first live run (4 Nov 2026) collected FAO (193,773 rows), EMODnet (29,256), World Bank, Fiskeridir, Brønnøysund, Statistics Norway and UN Comtrade. Eurostat, OpenAlex past page 1, Zenodo and GDELT failed, and have since been fixed or removed. Things that may still need adjusting:
 
-- **Fiskeridir:** species, company, org numbers and status came back empty in the first live run. The next run logs the first raw record of each source, which shows the real field names.
+- **Fiskeridir:** field names are now taken from the live record (species, licence status, area traffic light). The register's site records have no company IDs, so sites and companies don't join directly.
 - **FAO:** the release zip is looked up at `https://www.fao.org/fishery/static/Data/Aquaculture_<year>.1.<n>.zip` for the last four years. If FAO has renamed it, pass the zip link from the [download page](https://www.fao.org/fishery/en/collection/aquaculture) with `--url`. Columns and code lists are matched by name, and the log lists what was found if anything is missing.
 - **EMODnet:** layers are found by matching names and titles (`--layer-pattern`), so a renamed layer is still picked up.
 - **Brønnøysund:** if it has moved to the new SN2025 industry codes, pass them with `--nace`.
